@@ -13,6 +13,11 @@ crates/
   ups-cli/    command-line tool (scan / audit / info)
   ups-play/   terminal karaoke — plays the instrumental via symphonia,
               mic pitch via cpal, live scoring + lyric lines on stdout
+  ups-app/    axum + socketioxide server — drop-in for the Python app,
+              serves web/ verbatim; --tv embeds the native renderer
+  ups-tv/     native framebuffer renderer — minifb window, ffmpeg-piped
+              video, fontdue text, pitch lane + lyrics + scoring + fx,
+              no GPU/DOM/browser (~160 MB on the Pi incl. server)
 ```
 
 `ups-core` is a faithful port of the Python reference:
@@ -38,21 +43,47 @@ ups info  <file.upsong>      chart summary + perfect-run score check
 Working today: chart loading (both formats), the full scoring engine
 (verified numerically identical to the Python port on real charts),
 pitch detection math, manifest + folder library discovery, audit —
-and `ups-play`, a terminal karaoke session: symphonia-decoded audio
-playback (mp4/aac/mp3/…), cpal mic capture, live pitch scoring and
-lyric lines.
+`ups-play` terminal karaoke — and:
 
-Not yet: video window, web UI, karaoke pitch-lane rendering,
-autosync (the Python `sing.py` pitch/warp/whisper machinery — station
-charts are GAP-corrected already so plain GAP timing works).
+- `ups-app` — the party server: REST + socket.io contract the existing
+  `web/` frontend consumes unchanged (phone remote, host controls,
+  mic volume/mix, queue, search, scores), `ups-state.json` recovery,
+  PipeWire mic→speaker monitor on PipeWire systems.
+- `ups-tv` — the native screen: ffmpeg-decoded video + karaoke lyrics,
+  pitch lane, sung-tone trail, hit sparks, rating pops, eased score,
+  streak badges, results confetti, animated idle. `--tv` runs it
+  inside `ups-app`; `ups-tv <root> <search>` plays one song standalone.
 
-Next milestones, roughly:
+Not yet: pipeline ingestion (YouTube download / normalize / vocal cut /
+chart generation — still Python-side), duet per-mic routing, autosync
+(station charts are GAP-corrected so plain GAP works).
 
-1. `ups-app` — axum server reusing the existing `web/` frontend assets
-   (the Pi's HTML/JS UI is transport-agnostic over websockets), with
-   video + pitch lanes
-2. Cross-compile to `aarch64-unknown-linux-gnu` for the Pi itself
-   (rodio/cpal are pure Rust + ALSA — no C toolchain gymnastics)
+## Platforms
+
+The whole workspace is portable — no unix-only APIs; every external
+tool degrades gracefully when absent.
+
+| platform | build | notes |
+|---|---|---|
+| Raspberry Pi (labwc/Wayland) | `cargo build --release -p ups-app` | fullscreen via labwc windowRule (`app_id=ultra-pi-star`); PipeWire mic monitor active; `/sys/class/drm` picks native panel res |
+| Windows | `cargo build --release -p ups-tv` | works today; `ffmpeg.exe` on PATH; windowed 1280×720 (no /sys probe) — Esc quits |
+| macOS | `cargo build --release -p ups-tv` | `brew install ffmpeg`; build natively on the Mac (no practical cross-compile); fonts auto-resolve to Helvetica |
+
+Runtime deps: `ffmpeg` on PATH (video). Optional on Linux only:
+`pw-loopback`/`wpctl`/`pw-dump` for the speaker mic monitor — without
+them scoring still works, you just don't hear yourself.
+
+Standalone player (the light way to try it):
+
+```
+ups-tv <library-root> <search>   # e.g. ups-tv D:\songs "billie jean"
+```
+
+Full party server (phone join + queue + host controls):
+
+```
+ups-app --media <library-root> [--tv]   # --tv adds the native screen
+```
 
 License: GPL-3.0 (matching the source project and the WorldParty code
 it ports).

@@ -113,6 +113,83 @@ fn present(window: &mut Window, fb: &[u32], w: usize, h: usize) -> bool {
     }
 }
 
+/// rating tiers on the scorer's 0..8 scale — same ladder as the web
+/// TV ("PERFECT LINE" reserved for the top rung)
+const RATING_LABELS: [&str; 9] = [
+    "", "cool", "cool", "good", "good", "great", "excellent",
+    "superb", "PERFECT LINE",
+];
+
+struct Pop {
+    text: String,
+    born: f32,
+    big: bool,
+    golden: bool,
+}
+
+/// live effects state — particles, rating pops, eased score digits,
+/// streak milestones. All state is per-song; idle drift lives in run().
+struct Fx {
+    parts: Vec<render::Particle>,
+    pops: Vec<Pop>,
+    disp_score: f64,
+    last_streak: i64,
+    rng: u64,
+}
+
+impl Fx {
+    fn new() -> Self {
+        Fx {
+            parts: Vec::new(),
+            pops: Vec::new(),
+            disp_score: 0.0,
+            last_streak: 0,
+            rng: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos() as u64 | 1)
+                .unwrap_or(0x9e3779b9),
+        }
+    }
+    fn rand(&mut self) -> f32 {
+        self.rng = self
+            .rng
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((self.rng >> 33) as u32) as f32 / u32::MAX as f32
+    }
+    fn burst(&mut self, x: f32, y: f32, n: usize, rgb: u32, now: f32,
+             power: f32, grav: f32, life: f32) {
+        for _ in 0..n {
+            let a = self.rand() * std::f32::consts::TAU;
+            let v = power * (0.4 + self.rand());
+            let pl = life * (0.6 + self.rand() * 0.8);
+            self.parts.push(render::Particle {
+                x,
+                y,
+                vx: a.cos() * v,
+                vy: a.sin() * v - power * 0.4,
+                born: now,
+                life: pl,
+                rgb,
+                grav,
+            });
+        }
+    }
+    fn pop(&mut self, text: String, now: f32, big: bool, golden: bool) {
+        if text.is_empty() {
+            return;
+        }
+        self.pops.push(Pop { text, born: now, big, golden });
+    }
+    fn step(&mut self, dt: f32, now: f32) {
+        self.parts.retain(|p| p.alive(now));
+        for p in &mut self.parts {
+            p.step(dt);
+        }
+        self.pops.retain(|p| now - p.born < 1.6);
+    }
+}
+
 /// The kiosk loop — blocks until the window closes.
 pub fn run(driver: Arc<dyn Driver>) {
     // panics on minifb's internal wayland threads print by default, but
@@ -146,13 +223,14 @@ pub fn run(driver: Arc<dyn Driver>) {
     let mut fb = vec![0u32; w * h];
     let mut text = Text::new();
     let mut cur_id: Option<i64> = None;
+    let mut idle_fx = Fx::new();
 
     while window.is_open() && !window.is_key_down(Key::Escape) {
         let item = driver.current();
         match (item, cur_id) {
             (None, _) => {
                 cur_id = None;
-                draw_idle(&mut fb, w, h, &mut text, &driver);
+                draw_idle(&mut fb, w, h, &mut text, &driver, &mut idle_fx);
                 present(&mut window, &fb, w, h);
                 std::thread::sleep(Duration::from_millis(60));
             }
@@ -172,8 +250,51 @@ fn sc(fh: usize) -> f32 {
 }
 
 fn draw_idle(fb: &mut [u32], fw: usize, fh: usize,
-             text: &mut Option<Text>, driver: &Arc<dyn Driver>) {
+             text: &mut Option<Text>, driver: &Arc<dyn Driver>,
+             fx: &mut Fx) {
     render::fill(fb, render::BG);
+    // slow drifting embers — seeded once, recycled forever; subtle
+    // motion so the idle screen feels alive without being a lightshow
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f32())
+        .unwrap_or(0.0);
+    if fx.parts.is_empty() {
+        for _ in 0..70 {
+            let x = fx.rand() * fw as f32;
+            let y = fx.rand() * fh as f32;
+            let vx = -6.0 - fx.rand() * 10.0;
+            let vy = -3.0 - fx.rand() * 7.0;
+            let born = now - fx.rand() * 12.0;
+            let life = 12.0 + fx.rand() * 8.0;
+            let rgb = [0x4da3ff, 0xffd24d, 0x8a93a5]
+                [(fx.rand() * 3.0) as usize];
+            fx.parts.push(render::Particle {
+                x, y, vx, vy, born, life, rgb, grav: 0.0,
+            });
+        }
+    }
+    let mut respawn = Vec::new();
+    for (i, p) in fx.parts.iter_mut().enumerate() {
+        p.step(0.06);
+        if !p.alive(now) || p.x < -4.0 || p.y < -4.0 {
+            respawn.push(i);
+        }
+    }
+    for i in respawn {
+        let y = fx.rand() * fh as f32;
+        let vx = -6.0 - fx.rand() * 10.0;
+        let vy = -3.0 - fx.rand() * 7.0;
+        let life = 12.0 + fx.rand() * 8.0;
+        let p = &mut fx.parts[i];
+        p.x = fw as f32 + 4.0;
+        p.y = y;
+        p.vx = vx;
+        p.vy = vy;
+        p.born = now;
+        p.life = life;
+    }
+    render::draw_particles(fb, fw, fh, &fx.parts, now);
     let s = sc(fh);
     let (qr_data, join_url) = driver.idle_info();
     let title_px = (64.0 * s) as u32;
@@ -273,6 +394,12 @@ fn play_item(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
     let mut frame = vec![0u8; fw * fh * 3];
     let mut hit_flash_until = Instant::now();
     let mut last_tick = 0u64;
+    let mut fx = Fx::new();
+    let mut target_score: f64 = 0.0;
+    let mut cur_streak: i64 = 0;
+    let song_start = Instant::now();
+    let lane_y = (fh as f64 * 0.58) as i32;
+    let lane_h = (fh as f64 * 0.16) as i32;
 
     // intermission countdown — sink is paused, so nothing is audible
     // until it ends (media starts decoding only after, too)
@@ -338,8 +465,15 @@ fn play_item(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
     let score_px = (44.0 * s) as u32;
     let singer_px = (20.0 * s).max(10.0) as u32;
     let paused_px = (60.0 * s) as u32;
+    let pop_px = (34.0 * s).max(16.0) as u32;
+    let pop_big_px = (52.0 * s).max(24.0) as u32;
+    let mut last_frame = Instant::now();
 
     loop {
+        let dt = last_frame.elapsed().as_secs_f32().min(0.1);
+        last_frame = Instant::now();
+        let now_f32 = song_start.elapsed().as_secs_f32();
+        fx.step(dt, now_f32);
         if !window.is_open() || window.is_key_down(Key::Escape) {
             sink.stop();
             return;
@@ -401,10 +535,54 @@ fn play_item(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
                     tones.insert(tr.clone(), tone);
                 }
                 let r = s.tick(pos_ms, &tones);
+                let now_f32 = song_start.elapsed().as_secs_f32();
                 if r.last_hit.as_ref().and_then(|h| h.hit) == Some(true) {
                     hit_flash_until =
                         Instant::now() + Duration::from_millis(200);
+                    // sparks at the hit note's row on the playhead
+                    let geo = render::lane_geo(fw, lane_h, 6000.0);
+                    let tone = r
+                        .last_hit
+                        .as_ref()
+                        .and_then(|h| h.tone)
+                        .unwrap_or(24);
+                    let (px, ty) = render::lane_xy(
+                        geo, lane_y, lane_h, pos_ms, pos_ms, tone);
+                    let gold = r
+                        .last_hit
+                        .as_ref()
+                        .and_then(|h| h.kind.as_deref())
+                        .map(|k| k.contains("golden"))
+                        .unwrap_or(false);
+                    fx.burst(
+                        px as f32, ty as f32, 9,
+                        if gold { render::GOLDEN } else { 0xcfe6ff },
+                        now_f32, 90.0, 160.0, 0.9,
+                    );
                 }
+                for ev in &r.line_events {
+                    let ri = (ev.rating as usize)
+                        .min(RATING_LABELS.len() - 1);
+                    let perfect = ev.rating >= 8;
+                    fx.pop(RATING_LABELS[ri].to_string(), now_f32,
+                           perfect, ev.rating >= 6);
+                }
+                let st = r
+                    .players
+                    .get(&tracks[0])
+                    .map(|p| p.streak)
+                    .unwrap_or(0);
+                if st > fx.last_streak && st >= 5 && st % 5 == 0 {
+                    fx.pop(format!("x{st} streak!"), now_f32, true,
+                           true);
+                }
+                fx.last_streak = st;
+                cur_streak = st;
+                target_score = r
+                    .players
+                    .get(&tracks[0])
+                    .map(|p| (p.score + p.golden + p.line) as f64)
+                    .unwrap_or(target_score);
                 driver.emit(
                     "clock",
                     &json!({"ms": pos_ms}),
@@ -451,14 +629,18 @@ fn play_item(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
             render::fill(fb, render::BG);
         }
 
-        let lane_y = (fh as f64 * 0.58) as i32;
-        let lane_h = (fh as f64 * 0.16) as i32;
         if !notes.is_empty() {
             let sung = mic_tone.as_ref().and_then(|t| *t.lock().unwrap());
             render::draw_lane(
                 fb, fw, fh, &notes, gap_ms, beat_ms, pos_ms, lane_y,
                 lane_h, 6000.0, sung, Instant::now() < hit_flash_until,
             );
+            let log = sess
+                .as_ref()
+                .map(|s| s.tone_log.as_slice())
+                .unwrap_or(&[]);
+            render::draw_trail(fb, fw, fh, log, pos_ms, lane_y,
+                               lane_h, 6000.0);
         }
 
         if let Some(t) = text {
@@ -493,21 +675,23 @@ fn play_item(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
                        lh_y + (62.0 * s) as i32, next_px,
                        render::TEXT_DIM);
             }
-            let score = sess
-                .as_ref()
-                .and_then(|s| {
-                    s.scorers
-                        .get(&tracks[0])
-                        .map(|sc| sc.state.total())
-                })
-                .unwrap_or(0);
+            // eased score digits — the display value chases the real
+            // total instead of snapping (exponential approach, ~150ms)
+            fx.disp_score += (target_score - fx.disp_score)
+                * (1.0 - (-6.0 * dt as f64).exp());
             t.draw(fb, fw, fh,
                    &format!("{} — {}", it.artist, it.title),
                    (16.0 * s) as i32, (14.0 * s) as i32, hud_px,
                    render::TEXT_DIM);
-            t.draw(fb, fw, fh, &format!("{score}"),
+            t.draw(fb, fw, fh,
+                   &format!("{}", fx.disp_score.round() as i64),
                    fw as i32 - (160.0 * s) as i32, (12.0 * s) as i32,
                    score_px, render::TEXT);
+            if cur_streak >= 2 {
+                t.draw(fb, fw, fh, &format!("x{cur_streak}"),
+                       fw as i32 - (120.0 * s) as i32,
+                       (58.0 * s) as i32, hud_px, render::STREAK);
+            }
             if !it.singer.is_empty() {
                 t.draw(fb, fw, fh, &it.singer, (16.0 * s) as i32,
                        (38.0 * s) as i32, singer_px, render::TEXT_DIM);
@@ -518,7 +702,21 @@ fn play_item(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
                 t.draw(fb, fw, fh, p, (fw as i32 - w) / 2,
                        fh as i32 / 2, paused_px, render::GOLDEN);
             }
+            // rating pops rise and die over ~1.6s — perfect/big lines
+            // take the center in gold
+            for pop in &fx.pops {
+                let age = now_f32 - pop.born;
+                let px = if pop.big { pop_big_px } else { pop_px };
+                let w = t.width(&pop.text, px) as i32;
+                let py = lane_y - (20.0 * s) as i32
+                    - (age * 44.0 * s) as i32;
+                let col = if pop.golden { render::GOLDEN }
+                          else { render::TEXT };
+                t.draw(fb, fw, fh, &pop.text, (fw as i32 - w) / 2,
+                       py, px, col);
+            }
         }
+        render::draw_particles(fb, fw, fh, &fx.parts, now_f32);
 
         if !present(window, fb, fw, fh) {
             sink.stop();
@@ -554,7 +752,22 @@ fn results_card(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
     let wait_until = Instant::now() + Duration::from_secs(8);
     let head_px = (30.0 * s).max(14.0) as u32;
     let line_px = (36.0 * s).max(16.0) as u32;
+    // results confetti — one burst from the top-center, falls and
+    // fades through the card
+    let card_start = Instant::now();
+    let mut confetti = Fx::new();
+    for (i, col) in [render::GOLDEN, render::NOTE, render::FREESTYLE,
+                     0xc792ff, 0xff5a5a].iter().enumerate()
+    {
+        confetti.burst(fw as f32 / 2.0, fh as f32 * 0.18, 48, *col,
+                       i as f32 * 0.01, 260.0, 320.0, 3.2);
+    }
+    let mut card_last = Instant::now();
     while window.is_open() && Instant::now() < wait_until {
+        let cdt = card_last.elapsed().as_secs_f32().min(0.1);
+        card_last = Instant::now();
+        let cnow = card_start.elapsed().as_secs_f32();
+        confetti.step(cdt, cnow);
         render::fill(fb, render::BG);
         if let Some(t) = text {
             let head = format!("{} — {}", it.artist, it.title);
@@ -573,6 +786,7 @@ fn results_card(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
                 y += (64.0 * sc(fh)) as i32;
             }
         }
+        render::draw_particles(fb, fw, fh, &confetti.parts, cnow);
         present(window, fb, fw, fh);
         std::thread::sleep(Duration::from_millis(30));
     }
