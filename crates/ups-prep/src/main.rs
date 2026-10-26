@@ -12,6 +12,7 @@
 
 mod align;
 mod artwork;
+mod asr;
 mod ff;
 mod lyrics;
 mod separate;
@@ -251,6 +252,22 @@ fn main() -> Result<()> {
         println!("chart: {n} notes → {}", dest.display());
     }
 
+    // ASR — word onsets for chart generation + lyric anchoring.
+    // Prefer the 16k vocal stem; fall back to full-media audio.
+    let mut asr_words: Vec<asr::AsrWord> = Vec::new();
+    if asr::have_models(&args.models) {
+        stage("transcribing (asr)");
+        let voc = stem_path("vocals.wav");
+        let stem = voc.exists().then_some(voc.as_path());
+        match asr::transcribe_media(&media, stem, &args.models) {
+            Ok(w) => {
+                println!("asr: {} words", w.len());
+                asr_words = w;
+            }
+            Err(e) => eprintln!("asr failed: {e}"),
+        }
+    }
+
     // lyrics + artwork
     stage("fetching lyrics");
     let dur = ff::duration(&media).ok();
@@ -293,6 +310,13 @@ fn main() -> Result<()> {
         })),
         "has_inst": stem_path("inst.mp4").exists(),
         "has_chart": stem_path("upsong").exists(),
+        "asr": {
+            "engine": "sherpa-onnx parakeet-tdt-0.6b-v3",
+            "words": asr_words.len(),
+            "words_ms": asr_words.iter()
+                .map(|w| serde_json::json!([w.start_ms, w.word]))
+                .collect::<Vec<_>>(),
+        },
     });
     std::fs::write(stem_path("analysis.json"),
                    serde_json::to_string_pretty(&ana)?)?;
