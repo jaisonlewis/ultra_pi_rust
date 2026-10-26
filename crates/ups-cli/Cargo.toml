@@ -1,0 +1,8 @@
+[package]
+name = "ups-cli"
+description = "Ultra Pi Star CLI — scan libraries, inspect charts"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ups-core = { path = "../ups-core" }

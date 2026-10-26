@@ -1,0 +1,9 @@
+[package]
+name = "ups-core"
+description = "Ultra Pi Star core engine — charts, scoring, pitch, catalog"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
