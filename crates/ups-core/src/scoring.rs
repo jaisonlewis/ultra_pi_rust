@@ -71,7 +71,7 @@ impl PlayerScore {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct TickEvent {
     pub beat: i64,
     pub hit: Option<bool>,
@@ -81,7 +81,7 @@ pub struct TickEvent {
     pub line: Option<LineEvent>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct LineEvent {
     pub line: usize,
     pub perfection: f64,
@@ -344,6 +344,7 @@ impl Scorer {
     }
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct FinishSummary {
     pub score: i64,
     pub score_normal: i64,

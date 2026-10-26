@@ -168,7 +168,7 @@ fn main() {
             (44100, None)
         });
     let mut det = pitch::PitchDetector::new(det_rate, 2);
-    let mut sess = session::Session::new(c, "P1", 0, true);
+    let mut sess = session::Session::solo(c, "P1", 0, true);
 
     println!("\nsinging… (ctrl-c to stop)\n");
     let mut last_line = String::new();
@@ -184,10 +184,17 @@ fn main() {
         let tone = if pr.valid { Some(pr.tone_abs as i64) } else { None };
 
         let pos_ms = sink.get_pos().as_secs_f64() * 1000.0;
-        let r = sess.tick(pos_ms, tone);
+        let tones = {
+            let mut m = std::collections::BTreeMap::new();
+            m.insert("P1".to_string(), tone);
+            m
+        };
+        let r = sess.tick(pos_ms, &tones);
+        let p1 = r.players.get("P1");
 
         // current lyric line for display
-        let line_txt = sess.scorer.lines.iter()
+        let line_txt = sess.scorers.get("P1").map(|s| &s.lines).into_iter()
+            .flatten()
             .find(|l| l.first().map(|n| n.start).unwrap_or(0) <= r.beat
                    && r.beat < l.last().map(|n| n.start + n.length).unwrap_or(0))
             .map(|l| l.iter().enumerate().map(|(i, n)| format!(
@@ -198,7 +205,7 @@ fn main() {
             println!("\n  {}", line_txt);
             last_line = line_txt;
         }
-        let tgt = r.target.map(|t| {
+        let tgt = r.targets.get("P1").map(|&t| {
             format!("{}", pitch::PitchResult {
                 valid: true, tone: (t % 12) as i32, tone_abs: t as i32,
                 volume: 0.0 }.tone_str())
@@ -206,16 +213,19 @@ fn main() {
         print!("\r\x1b[K  {}:{:02}  score {:>5}  streak {:>2}  \
                 sung {:>3}  target {:>3}",
                pos_ms as u64 / 60000, (pos_ms as u64 / 1000) % 60,
-               r.score, r.streak, pr.tone_str(), tgt);
+               p1.map(|p| p.score).unwrap_or(0),
+               p1.map(|p| p.streak).unwrap_or(0), pr.tone_str(), tgt);
         std::io::stdout().flush().ok();
 
         if sink.empty() {
             break;
         }
     }
-    let f = sess.finish();
-    println!("\n\nfinal: {} pts ({} normal + {} golden + {} line)  \
-              {} notes hit / {} perfect / max streak {}",
-             f.score, f.score_normal, f.score_golden, f.score_line,
-             f.hits, f.perfect, f.max_streak);
+    let finals = sess.finish();
+    if let Some(f) = finals.get("P1") {
+        println!("\n\nfinal: {} pts ({} normal + {} golden + {} line)  \
+                  {} notes hit / {} perfect / max streak {}",
+                 f.score, f.score_normal, f.score_golden, f.score_line,
+                 f.hits, f.perfect, f.max_streak);
+    }
 }

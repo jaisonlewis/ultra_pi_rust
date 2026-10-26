@@ -1,0 +1,20 @@
+[package]
+name = "ups-app"
+description = "Ultra Pi Star karaoke server — axum + socket.io, drop-in for the Python app"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ups-core = { path = "../ups-core" }
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+socketioxide = { version = "0.18", features = ["state"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["fs"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+minijinja = "3"
+rust-embed = "8"
+qrcode = "0.14"
+base64 = "0.22"
+cpal = "0.15"

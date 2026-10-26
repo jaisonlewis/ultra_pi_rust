@@ -455,6 +455,95 @@ pub fn save_native(chart: &Chart, path: &Path) -> std::io::Result<()> {
     )
 }
 
+/// TV overlay payload — port of `catalog.chart_payload` (Python).
+/// Beats→ms via BPM/GAP; `sync_offset_ms` and `warp` carry per-entry
+/// learned timing (both zero/empty for prepared charts).
+/// Shape: {is_duet, offset_ms, has_alt, rom, bpm, beat_ms, gap_ms,
+///         warp, tracks:{t:[{start_ms,end_ms,text,syls:[{t,wb,start_ms,
+///         end_ms}]}]}, lanes:{t:[{start_ms,end_ms,tone,kind,text}]}}
+pub fn lane_payload(chart: &Chart, rom: bool, sync_offset_ms: f64,
+                    warp: &[(i64, f64)]) -> serde_json::Value {
+    use serde_json::json;
+    let has_alt = chart
+        .tracks
+        .values()
+        .flatten()
+        .any(|n| !n.alt.is_empty());
+    let rom = rom && has_alt;
+    let beat_ms = 15000.0 / chart.bpm();
+    let base = chart.gap_ms() + sync_offset_ms;
+    let warp_sorted: Vec<(i64, f64)> = {
+        let mut w = warp.to_vec();
+        w.sort_by_key(|(b, _)| *b);
+        w
+    };
+    let warp_at = |beat: i64| -> f64 {
+        let mut off = base;
+        for &(wb, wo) in &warp_sorted {
+            if wb <= beat {
+                off = chart.gap_ms() + wo;
+            } else {
+                break;
+            }
+        }
+        off
+    };
+    let mut tracks = serde_json::Map::new();
+    for (track, phrases) in chart.phrases() {
+        tracks.insert(
+            track,
+            phrases
+                .iter()
+                .map(|p| {
+                    json!({
+                        "start_ms": p.start as f64 * beat_ms + warp_at(p.start),
+                        "end_ms": p.end as f64 * beat_ms + warp_at(p.start),
+                        "text": if rom { p.atext.clone().unwrap_or_else(|| p.text.clone()) } else { p.text.clone() },
+                        "syls": p.syls.iter().map(|s| json!({
+                            "t": if rom { s.at.clone().unwrap_or_else(|| s.t.clone()) } else { s.t.clone() },
+                            "wb": s.wb,
+                            "start_ms": s.s as f64 * beat_ms + warp_at(s.s),
+                            "end_ms": s.e as f64 * beat_ms + warp_at(s.s),
+                        })).collect::<Vec<_>>(),
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into(),
+        );
+    }
+    let mut lanes = serde_json::Map::new();
+    for (track, notes) in &chart.tracks {
+        lanes.insert(
+            track.clone(),
+            notes
+                .iter()
+                .map(|n| {
+                    json!({
+                        "start_ms": n.start as f64 * beat_ms + warp_at(n.start),
+                        "end_ms": (n.start + n.length) as f64 * beat_ms + warp_at(n.start),
+                        "tone": n.pitch,
+                        "kind": n.kind,
+                        "text": if rom && !n.alt.is_empty() { n.alt.clone() } else { n.text.clone() },
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into(),
+        );
+    }
+    json!({
+        "is_duet": chart.is_duet(),
+        "offset_ms": sync_offset_ms,
+        "has_alt": has_alt,
+        "rom": rom,
+        "bpm": chart.bpm(),
+        "beat_ms": beat_ms,
+        "gap_ms": chart.gap_ms(),
+        "warp": warp_sorted.iter().map(|(b, o)| json!([b, o])).collect::<Vec<_>>(),
+        "tracks": tracks,
+        "lanes": lanes,
+    })
+}
+
 /// Load the canonical chart — a native .upsong when present, otherwise
 /// import the .txt and cache the native form alongside it (lazy migration;
 /// ignored when the directory is read-only).
