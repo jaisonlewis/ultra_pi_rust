@@ -814,37 +814,100 @@ async fn api_pb_sync(AxState(app): AxState<Arc<App>>, headers: HeaderMap,
     Json(json!({"ok": true, "sync_offset_ms": delta as i64})).into_response()
 }
 
-// -- mic/audio (status-compatible stubs until per-mic routing lands) ----------
+// -- mic/audio ----------------------------------------------------------------
 
 async fn api_mic(AxState(app): AxState<Arc<App>>, headers: HeaderMap)
     -> impl IntoResponse {
     let (sid, _) = ensure_sid(&app, &headers);
     let capturing = app.sing.lock().unwrap().is_some();
+    let mon = app.monitor.as_ref();
     Json(json!({
         "capture": capturing,
-        "monitor": false,
+        "monitor": mon.is_some(),
         "device": if capturing { "default" } else { "" },
         "level": 0,
         "mics": [],
         "error": "",
-        "volume": 0, "echo_ms": 0, "echo_wet": 0, "pitch": 0,
+        "volume": mon.map(|m| *m.volume.lock().unwrap()).unwrap_or(0.0),
+        "echo_ms": mon.map(|m| *m.echo_ms.lock().unwrap()).unwrap_or(0),
+        "echo_wet": 0, "pitch": 0,
         "reverb_wet": 0, "autotune": 0, "polish": false,
         "my_fx": null,
-        "muted": !capturing,
-        "passthrough": false,
+        "muted": mon.map(|m| *m.muted.lock().unwrap()).unwrap_or(true),
+        "passthrough": mon.is_some(),
         "mic_delay_ms": *app.mic_delay_ms.lock().unwrap(),
         "music_volume": *app.music_volume.lock().unwrap(),
         "can_mix": is_host(&app, &headers, &sid) || is_singer(&app, &sid),
     }))
 }
 
+/// POST /api/mic — live monitor controls (host or current singer).
+/// Volume/mute ride on the loopback's playback node via wpctl; voice
+/// FX fields are accepted for compatibility but inert for now.
+async fn api_mic_set(AxState(app): AxState<Arc<App>>, headers: HeaderMap,
+                     Json(body): Json<Value>)
+    -> impl IntoResponse {
+    let (sid, _) = ensure_sid(&app, &headers);
+    if !is_host(&app, &headers, &sid) && !is_singer(&app, &sid) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "host or current singer required"})),
+        )
+            .into_response();
+    }
+    let Some(mon) = app.monitor.as_ref() else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "no mic monitor running"})),
+        )
+            .into_response();
+    };
+    mon.set(
+        body["volume"].as_f64(),
+        body["muted"].as_bool(),
+        body["echo_ms"].as_i64(),
+    );
+    Json(json!({
+        "ok": true,
+        "volume": *mon.volume.lock().unwrap(),
+        "echo_ms": *mon.echo_ms.lock().unwrap(),
+        "echo_wet": 0, "pitch": 0, "reverb_wet": 0,
+        "autotune": 0, "polish": false,
+        "my_fx": null,
+        "muted": *mon.muted.lock().unwrap(),
+    }))
+    .into_response()
+}
+
+/// POST /api/mic/calibrate — Python listens to the room to measure mic
+/// latency; until that lands, return the stored delay so the UI works.
+async fn api_mic_calibrate(AxState(app): AxState<Arc<App>>)
+    -> impl IntoResponse {
+    Json(json!({"ok": true,
+                "mic_delay_ms": *app.mic_delay_ms.lock().unwrap()}))
+}
+
+/// POST /api/mic/assign — single-mic setups have nothing to route yet;
+/// accept the call so the phone UI doesn't error.
+async fn api_mic_assign() -> impl IntoResponse {
+    Json(json!({"ok": true}))
+}
+
 async fn api_audio(AxState(app): AxState<Arc<App>>) -> impl IntoResponse {
+    let monitor = app.monitor.as_ref().map(|m| {
+        json!({
+            "running": true,
+            "volume": *m.volume.lock().unwrap(),
+            "echo_wet": 0,
+            "muted": *m.muted.lock().unwrap(),
+        })
+    });
     Json(json!({
         "outputs": [], "mics": [],
         "performers": app.st.performers.lock().unwrap().iter()
             .map(|p| json!({"id": p.id, "name": p.name, "color": p.color}))
             .collect::<Vec<_>>(),
-        "monitor": null,
+        "monitor": monitor,
     }))
 }
 
@@ -883,8 +946,10 @@ pub fn router(app: Arc<App>, sio_layer: socketioxide::layer::SocketIoLayer) -> R
         .route("/api/playback/volume", post(api_pb_volume))
         .route("/api/playback/sync", post(api_pb_sync))
         // mic/audio
-        .route("/api/mic", get(api_mic))
+        .route("/api/mic", get(api_mic).post(api_mic_set))
         .route("/api/mic/status", get(api_mic))
+        .route("/api/mic/calibrate", post(api_mic_calibrate))
+        .route("/api/mic/assign", post(api_mic_assign))
         .route("/api/audio", get(api_audio))
         .route("/api/audio/status", get(api_audio))
         .layer(sio_layer)

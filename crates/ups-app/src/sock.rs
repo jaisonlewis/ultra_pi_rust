@@ -33,6 +33,8 @@ pub struct App {
     /// native TV renderer present → don't wait on a browser
     pub native_tv: bool,
     pub paused: std::sync::atomic::AtomicBool,
+    /// pw-loopback speaker monitor — None off-PipeWire hosts
+    pub monitor: Option<crate::monitor::Monitor>,
 }
 
 impl ups_tv::Driver for App {
@@ -54,6 +56,13 @@ impl ups_tv::Driver for App {
         } else {
             e.media.clone()
         };
+        // the karaoke mp4 carries the video too — decode frames from the
+        // SAME file that supplies the audio clock so they can't drift
+        let video = if e.audio_only {
+            None
+        } else {
+            Some(audio.clone())
+        };
         let p1 = self.st.performer(it.performer_id);
         let p2 = it.performer2_id.and_then(|id| self.st.performer(id));
         let singer = match (p1, p2) {
@@ -64,7 +73,7 @@ impl ups_tv::Driver for App {
         Some(ups_tv::PlayItem {
             id: it.id,
             audio,
-            video: Some(e.media.clone()),
+            video,
             chart: e.chart.clone(),
             artist: e.artist.clone(),
             title: e.title.clone(),

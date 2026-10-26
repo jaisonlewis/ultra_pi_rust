@@ -2,6 +2,10 @@
 //! on screen now" and receives lifecycle callbacks; the loop owns the
 //! audio sink (master clock), the ffmpeg video pipe, mic capture,
 //! scoring, and the framebuffer.
+//!
+//! The framebuffer always matches the window size exactly — minifb
+//! requires buffer dims == window dims, so everything renders at the
+//! panel's native resolution. Layout scales off a 720p baseline.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -17,7 +21,6 @@ use ups_core::decode::StreamingSource;
 use ups_core::session::Session;
 
 use crate::render;
-use crate::render::{H, W};
 use crate::text::Text;
 use crate::video::VideoPipe;
 
@@ -29,8 +32,8 @@ pub struct PlayItem {
     pub id: i64,
     /// audio source (instrumental when vocal-cut applies)
     pub audio: PathBuf,
-    /// video source — always the original media so audio-only stems
-    /// still show a picture
+    /// video source — the same file as `audio` (karaoke mp4s carry the
+    /// video too), so picture and clock can never drift apart
     pub video: Option<PathBuf>,
     pub chart: Option<PathBuf>,
     pub artist: String,
@@ -66,16 +69,71 @@ pub trait Driver: Send + Sync {
     }
 }
 
+/// Native panel resolution — the first DRM mode is the preferred one
+/// on the Pi's HDMI out. Dev machines have no /sys/class/drm entry and
+/// fall back to 720p.
+fn screen_size() -> (usize, usize) {
+    if let Ok(dir) = std::fs::read_dir("/sys/class/drm") {
+        for e in dir.flatten() {
+            let Ok(txt) = std::fs::read_to_string(e.path().join("modes"))
+            else {
+                continue;
+            };
+            if let Some(first) = txt.lines().next() {
+                let mut it = first.trim().split('x');
+                let (w, h) = (
+                    it.next().unwrap_or("0").parse().unwrap_or(0),
+                    it.next().unwrap_or("0").parse().unwrap_or(0),
+                );
+                if w > 0 && h > 0 {
+                    return (w, h);
+                }
+            }
+        }
+    }
+    (1280, 720)
+}
+
+/// log to stderr — every call site also flushes through eprintln,
+/// but keep one place so the format stays uniform
+macro_rules! tlog {
+    ($($arg:tt)*) => { eprintln!("tv: {}", format!($($arg)*)) };
+}
+
+/// update_with_buffer can fail (compositor drops the surface, resize
+/// races) — a failed present shouldn't kill the kiosk, and a *dead*
+/// surface should tell us why in the log instead of dying silently.
+fn present(window: &mut Window, fb: &[u32], w: usize, h: usize) -> bool {
+    match window.update_with_buffer(fb, w, h) {
+        Ok(()) => true,
+        Err(e) => {
+            tlog!("update_with_buffer failed: {e}");
+            false
+        }
+    }
+}
+
 /// The kiosk loop — blocks until the window closes.
 pub fn run(driver: Arc<dyn Driver>) {
+    // panics on minifb's internal wayland threads print by default, but
+    // a panic on THIS thread while a child thread holds the surface
+    // deadlocks — hook logs before unwind regardless of thread
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        eprintln!("tv: PANIC: {info}");
+        prev(info);
+    }));
+
+    let (w, h) = screen_size();
+    tlog!("screen {}x{}", w, h);
     let mut window = Window::new(
-        // app_id — labwc fullscreens this via a windowRule
+        // app_id — labwc fullscreens this via a windowRule; sizing the
+        // window to the panel makes it fill the screen either way
         "ultra-pi-star",
-        W,
-        H,
+        w,
+        h,
         WindowOptions {
             resize: false,
-            scale: minifb::Scale::FitScreen,
             borderless: true,
             topmost: true,
             ..WindowOptions::default()
@@ -83,8 +141,9 @@ pub fn run(driver: Arc<dyn Driver>) {
     )
     .expect("window");
     window.set_target_fps(30);
+    tlog!("window open");
 
-    let mut fb = vec![0u32; W * H];
+    let mut fb = vec![0u32; w * h];
     let mut text = Text::new();
     let mut cur_id: Option<i64> = None;
 
@@ -93,34 +152,46 @@ pub fn run(driver: Arc<dyn Driver>) {
         match (item, cur_id) {
             (None, _) => {
                 cur_id = None;
-                draw_idle(&mut fb, &mut text, &driver);
-                window.update_with_buffer(&fb, W, H).unwrap();
+                draw_idle(&mut fb, w, h, &mut text, &driver);
+                present(&mut window, &fb, w, h);
                 std::thread::sleep(Duration::from_millis(60));
             }
             (Some(it), _) => {
                 cur_id = Some(it.id);
-                play_item(&mut window, &mut fb, &mut text, &driver, it);
+                tlog!("item {} — {}", it.id, it.title);
+                play_item(&mut window, &mut fb, w, h, &mut text, &driver, it);
             }
         }
     }
 }
 
-fn draw_idle(fb: &mut [u32], text: &mut Option<Text>, driver: &Arc<dyn Driver>) {
+/// layout scale — all pixel constants are written for 720p and scaled
+/// to the actual panel (1080p → ×1.5)
+fn sc(fh: usize) -> f32 {
+    fh as f32 / 720.0
+}
+
+fn draw_idle(fb: &mut [u32], fw: usize, fh: usize,
+             text: &mut Option<Text>, driver: &Arc<dyn Driver>) {
     render::fill(fb, render::BG);
+    let s = sc(fh);
     let (qr_data, join_url) = driver.idle_info();
+    let title_px = (64.0 * s) as u32;
+    let sub_px = (26.0 * s).max(12.0) as u32;
+    let url_px = (30.0 * s).max(14.0) as u32;
     if let Some(t) = text {
         let title = "Ultra Pi Star";
-        let w = t.width(title, 64) as i32;
-        t.draw(fb, W, H, title, (W as i32 - w) / 2, 180, 64,
-               render::TEXT);
+        let w = t.width(title, title_px) as i32;
+        t.draw(fb, fw, fh, title, (fw as i32 - w) / 2,
+               (180.0 * s) as i32, title_px, render::TEXT);
         let sub = "Scan to join & queue a song";
-        let w2 = t.width(sub, 26) as i32;
-        t.draw(fb, W, H, sub, (W as i32 - w2) / 2, 270, 26,
-               render::TEXT_DIM);
+        let w2 = t.width(sub, sub_px) as i32;
+        t.draw(fb, fw, fh, sub, (fw as i32 - w2) / 2,
+               (270.0 * s) as i32, sub_px, render::TEXT_DIM);
         if !join_url.is_empty() {
-            let w3 = t.width(&join_url, 30) as i32;
-            t.draw(fb, W, H, &join_url, (W as i32 - w3) / 2,
-                   560, 30, render::TEXT);
+            let w3 = t.width(&join_url, url_px) as i32;
+            t.draw(fb, fw, fh, &join_url, (fw as i32 - w3) / 2,
+                   (560.0 * s) as i32, url_px, render::TEXT);
         }
     }
     // QR modules drawn directly — no image decode needed
@@ -128,24 +199,27 @@ fn draw_idle(fb: &mut [u32], text: &mut Option<Text>, driver: &Arc<dyn Driver>) 
         if let Ok(code) = qrcode::QrCode::new(qr_data.as_bytes()) {
             let mods = code.to_colors();
             let side = code.width();
-            let cell = 6i32;
-            let ox = (W as i32 - side as i32 * cell) / 2;
-            let oy = 330;
-            render::rect(fb, ox - 12, oy - 12, side as i32 * cell + 24,
+            let cell = (6.0 * s).max(2.0) as i32;
+            let ox = (fw as i32 - side as i32 * cell) / 2;
+            let oy = (330.0 * s) as i32;
+            render::rect(fb, fw, fh, ox - 12, oy - 12,
+                         side as i32 * cell + 24,
                          side as i32 * cell + 24, 0xffffff, 255);
             for (i, c) in mods.iter().enumerate() {
                 if *c == qrcode::Color::Dark {
                     let x = ox + (i % side) as i32 * cell;
                     let y = oy + (i / side) as i32 * cell;
-                    render::rect(fb, x, y, cell, cell, 0x000000, 255);
+                    render::rect(fb, fw, fh, x, y, cell, cell, 0x000000, 255);
                 }
             }
         }
     }
 }
 
-fn play_item(window: &mut Window, fb: &mut [u32], text: &mut Option<Text>,
+fn play_item(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
+             text: &mut Option<Text>,
              driver: &Arc<dyn Driver>, it: PlayItem) {
+    let s = sc(fh);
     // audio is the master clock — same rule as the web TV
     let src = match StreamingSource::open(&it.audio) {
         Ok(s) => s,
@@ -196,7 +270,7 @@ fn play_item(window: &mut Window, fb: &mut [u32], text: &mut Option<Text>,
     let mic_tone = mic.as_ref().map(|m| Arc::clone(&m.tone));
     driver.emit("mic:state", &json!({"ok": mic.is_some()}));
 
-    let mut frame = vec![0u8; W * H * 3];
+    let mut frame = vec![0u8; fw * fh * 3];
     let mut hit_flash_until = Instant::now();
     let mut last_tick = 0u64;
 
@@ -204,6 +278,9 @@ fn play_item(window: &mut Window, fb: &mut [u32], text: &mut Option<Text>,
     // until it ends (media starts decoding only after, too)
     let play_at = driver.play_at();
     if play_at > now_secs() {
+        let label_px = (40.0 * s).max(16.0) as u32;
+        let num_px = (90.0 * s) as u32;
+        let singer_px = (26.0 * s).max(12.0) as u32;
         loop {
             let left = play_at - now_secs();
             if left <= 0.0
@@ -218,21 +295,24 @@ fn play_item(window: &mut Window, fb: &mut [u32], text: &mut Option<Text>,
             render::fill(fb, render::BG);
             if let Some(t) = text {
                 let label = format!("{} — {}", it.artist, it.title);
-                let w = t.width(&label, 40) as i32;
-                t.draw(fb, W, H, &label, (W as i32 - w) / 2,
-                       H as i32 / 2 - 40, 40, render::TEXT);
+                let w = t.width(&label, label_px) as i32;
+                t.draw(fb, fw, fh, &label, (fw as i32 - w) / 2,
+                       fh as i32 / 2 - (40.0 * s) as i32, label_px,
+                       render::TEXT);
                 let n = format!("{}", left.ceil() as i32);
-                let w2 = t.width(&n, 90) as i32;
-                t.draw(fb, W, H, &n, (W as i32 - w2) / 2,
-                       H as i32 / 2 + 40, 90, render::GOLDEN);
+                let w2 = t.width(&n, num_px) as i32;
+                t.draw(fb, fw, fh, &n, (fw as i32 - w2) / 2,
+                       fh as i32 / 2 + (40.0 * s) as i32, num_px,
+                       render::GOLDEN);
                 if !it.singer.is_empty() {
-                    let s = format!("get ready, {}", it.singer);
-                    let w3 = t.width(&s, 26) as i32;
-                    t.draw(fb, W, H, &s, (W as i32 - w3) / 2,
-                           H as i32 / 2 - 90, 26, render::TEXT_DIM);
+                    let sv = format!("get ready, {}", it.singer);
+                    let w3 = t.width(&sv, singer_px) as i32;
+                    t.draw(fb, fw, fh, &sv, (fw as i32 - w3) / 2,
+                           fh as i32 / 2 - (90.0 * s) as i32, singer_px,
+                           render::TEXT_DIM);
                 }
             }
-            window.update_with_buffer(fb, W, H).unwrap();
+            present(window, fb, fw, fh);
             std::thread::sleep(Duration::from_millis(50));
         }
     }
@@ -240,14 +320,24 @@ fn play_item(window: &mut Window, fb: &mut [u32], text: &mut Option<Text>,
     let mut pipe = if !it.audio_only {
         it.video
             .as_ref()
-            .and_then(|v| VideoPipe::open(v, W, H, 25.0))
+            .and_then(|v| VideoPipe::open(v, fw, fh, 25.0))
     } else {
         None
     };
+    tlog!("video pipe: {}", if pipe.is_some() { "open" } else { "none" });
+    let mut stat_at = Instant::now();
     let mut video_done = pipe.is_none();
     let mut audio_done_at: Option<Instant> = None;
     let dur_ms = dur.as_secs_f64() * 1000.0;
+    let play_start = Instant::now();
     sink.play();
+
+    let lyric_px = (42.0 * s).max(18.0) as u32;
+    let next_px = (26.0 * s).max(12.0) as u32;
+    let hud_px = (22.0 * s).max(10.0) as u32;
+    let score_px = (44.0 * s) as u32;
+    let singer_px = (20.0 * s).max(10.0) as u32;
+    let paused_px = (60.0 * s) as u32;
 
     loop {
         if !window.is_open() || window.is_key_down(Key::Escape) {
@@ -282,13 +372,13 @@ fn play_item(window: &mut Window, fb: &mut [u32], text: &mut Option<Text>,
         if let Some(p) = &mut pipe {
             let want = (pos_ms / 1000.0 * p.fps) as u64;
             loop {
+                if p.frames >= want {
+                    break;
+                }
                 match p.rx.try_recv() {
                     Ok(f) => {
                         frame = f;
                         p.frames += 1;
-                        if p.frames >= want {
-                            break;
-                        }
                     }
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                         video_done = true;
@@ -336,25 +426,43 @@ fn play_item(window: &mut Window, fb: &mut [u32], text: &mut Option<Text>,
                 }
             }
         }
+        // telemetry — frame lag tells us if the decoder can't keep up
+        if stat_at.elapsed() > Duration::from_secs(2) {
+            stat_at = Instant::now();
+            if let Some(p) = &pipe {
+                let want = (pos_ms / 1000.0 * p.fps) as u64;
+                tlog!(
+                    "pos {:.1}s wall {:.1}s produced {} decoded {} want {} \
+                     lag {} frames",
+                    pos_ms / 1000.0,
+                    play_start.elapsed().as_secs_f64(),
+                    p.produced
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    p.frames,
+                    want,
+                    want as i64 - p.frames as i64
+                );
+            }
+        }
         // compose
         if pipe.is_some() {
-            render::blit_video(fb, &frame);
+            render::blit_video(fb, &frame, fw, fh);
         } else {
             render::fill(fb, render::BG);
         }
 
-        let lane_y = (H as f64 * 0.58) as i32;
-        let lane_h = (H as f64 * 0.16) as i32;
+        let lane_y = (fh as f64 * 0.58) as i32;
+        let lane_h = (fh as f64 * 0.16) as i32;
         if !notes.is_empty() {
             let sung = mic_tone.as_ref().and_then(|t| *t.lock().unwrap());
             render::draw_lane(
-                fb, &notes, gap_ms, beat_ms, pos_ms, lane_y, lane_h,
-                6000.0, sung, Instant::now() < hit_flash_until,
+                fb, fw, fh, &notes, gap_ms, beat_ms, pos_ms, lane_y,
+                lane_h, 6000.0, sung, Instant::now() < hit_flash_until,
             );
         }
 
         if let Some(t) = text {
-            let lh_y = (H as f64 * 0.82) as i32;
+            let lh_y = (fh as f64 * 0.82) as i32;
             let cur = phrases.iter().find(|p| {
                 pos_ms >= gap_ms + p.start as f64 * beat_ms
                     && pos_ms < gap_ms + p.end as f64 * beat_ms + 400.0
@@ -363,24 +471,27 @@ fn play_item(window: &mut Window, fb: &mut [u32], text: &mut Option<Text>,
                 .iter()
                 .find(|p| gap_ms + p.start as f64 * beat_ms > pos_ms);
             if let Some(p) = cur {
-                let mut cx = (W as i32 - t.width(&p.text, 42) as i32) / 2;
+                let mut cx =
+                    (fw as i32 - t.width(&p.text, lyric_px) as i32) / 2;
                 for syl in &p.syls {
                     let sung_on =
                         gap_ms + syl.s as f64 * beat_ms <= pos_ms;
                     cx += t.draw(
-                        fb, W, H, &syl.t, cx, lh_y, 42,
+                        fb, fw, fh, &syl.t, cx, lh_y, lyric_px,
                         if sung_on { render::SUNG } else { render::TEXT },
                     ) as i32;
                     if syl.wb {
-                        cx += t.draw(fb, W, H, " ", cx, lh_y, 42,
-                                     render::TEXT) as i32;
+                        cx += t.draw(fb, fw, fh, " ", cx, lh_y,
+                                     lyric_px, render::TEXT)
+                            as i32;
                     }
                 }
             }
             if let Some(p) = next {
-                let w = t.width(&p.text, 26) as i32;
-                t.draw(fb, W, H, &p.text, (W as i32 - w) / 2,
-                       lh_y + 62, 26, render::TEXT_DIM);
+                let w = t.width(&p.text, next_px) as i32;
+                t.draw(fb, fw, fh, &p.text, (fw as i32 - w) / 2,
+                       lh_y + (62.0 * s) as i32, next_px,
+                       render::TEXT_DIM);
             }
             let score = sess
                 .as_ref()
@@ -390,29 +501,35 @@ fn play_item(window: &mut Window, fb: &mut [u32], text: &mut Option<Text>,
                         .map(|sc| sc.state.total())
                 })
                 .unwrap_or(0);
-            t.draw(fb, W, H,
+            t.draw(fb, fw, fh,
                    &format!("{} — {}", it.artist, it.title),
-                   20, 16, 22, render::TEXT_DIM);
-            t.draw(fb, W, H, &format!("{score}"), W as i32 - 160,
-                   16, 44, render::TEXT);
+                   (16.0 * s) as i32, (14.0 * s) as i32, hud_px,
+                   render::TEXT_DIM);
+            t.draw(fb, fw, fh, &format!("{score}"),
+                   fw as i32 - (160.0 * s) as i32, (12.0 * s) as i32,
+                   score_px, render::TEXT);
             if !it.singer.is_empty() {
-                t.draw(fb, W, H, &it.singer, 20, 40, 20,
-                       render::TEXT_DIM);
+                t.draw(fb, fw, fh, &it.singer, (16.0 * s) as i32,
+                       (38.0 * s) as i32, singer_px, render::TEXT_DIM);
             }
             if driver.paused() {
                 let p = "PAUSED";
-                let w = t.width(p, 60) as i32;
-                t.draw(fb, W, H, p, (W as i32 - w) / 2,
-                       H as i32 / 2, 60, render::GOLDEN);
+                let w = t.width(p, paused_px) as i32;
+                t.draw(fb, fw, fh, p, (fw as i32 - w) / 2,
+                       fh as i32 / 2, paused_px, render::GOLDEN);
             }
         }
 
-        window.update_with_buffer(fb, W, H).unwrap();
+        if !present(window, fb, fw, fh) {
+            sink.stop();
+            return;
+        }
         std::thread::sleep(Duration::from_millis(4));
 
         // song ends when BOTH are done: audio reached its end and the
         // video pipe has drained its last frame
         if audio_done_at.is_some() && video_done {
+            tlog!("item {} finished (audio {}s, video done)", it.id, dur.as_secs());
             let score = sess
                 .as_mut()
                 .and_then(|s| {
@@ -422,37 +539,41 @@ fn play_item(window: &mut Window, fb: &mut [u32], text: &mut Option<Text>,
                         .map(|f| f.score)
                 })
                 .unwrap_or(0);
-            results_card(window, fb, text, &it, sess.as_mut());
+            results_card(window, fb, fw, fh, text, &it, sess.as_mut());
             driver.item_done(it.id, score);
             return;
         }
     }
 }
 
-fn results_card(window: &mut Window, fb: &mut [u32],
+fn results_card(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
                 text: &mut Option<Text>, it: &PlayItem,
                 sess: Option<&mut Session>) {
+    let s = sc(fh);
     let fin = sess.map(|s| s.finish()).unwrap_or_default();
     let wait_until = Instant::now() + Duration::from_secs(8);
+    let head_px = (30.0 * s).max(14.0) as u32;
+    let line_px = (36.0 * s).max(16.0) as u32;
     while window.is_open() && Instant::now() < wait_until {
         render::fill(fb, render::BG);
         if let Some(t) = text {
             let head = format!("{} — {}", it.artist, it.title);
-            let w = t.width(&head, 30) as i32;
-            t.draw(fb, W, H, &head, (W as i32 - w) / 2,
-                   H as i32 / 2 - 150, 30, render::TEXT_DIM);
-            let mut y = H as i32 / 2 - 90;
+            let w = t.width(&head, head_px) as i32;
+            t.draw(fb, fw, fh, &head, (fw as i32 - w) / 2,
+                   fh as i32 / 2 - (150.0 * s) as i32, head_px,
+                   render::TEXT_DIM);
+            let mut y = fh as i32 / 2 - (90.0 * s) as i32;
             for (tr, s) in &fin {
                 let line = format!(
                     "{tr}   {} pts   {}/{} hits   {} perfect   x{} streak",
                     s.score, s.hits, s.notes, s.perfect, s.max_streak);
-                let w = t.width(&line, 36) as i32;
-                t.draw(fb, W, H, &line, (W as i32 - w) / 2, y, 36,
-                       render::TEXT);
-                y += 64;
+                let w = t.width(&line, line_px) as i32;
+                t.draw(fb, fw, fh, &line, (fw as i32 - w) / 2, y,
+                       line_px, render::TEXT);
+                y += (64.0 * sc(fh)) as i32;
             }
         }
-        window.update_with_buffer(fb, W, H).unwrap();
+        present(window, fb, fw, fh);
         std::thread::sleep(Duration::from_millis(30));
     }
 }

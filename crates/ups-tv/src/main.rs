@@ -49,16 +49,20 @@ fn resolve(args: &[String]) -> Option<PlayItem> {
             })
     }?;
     let name = s.media.display().to_string().to_lowercase();
+    let audio = s.inst.clone().unwrap_or_else(|| s.media.clone());
+    // video from the played file — the karaoke mp4 carries its own
+    // stream, and one file = one timeline = no drift
+    let audio_only = ["mp3", "m4a", "ogg", "wav", "flac"]
+        .iter()
+        .any(|e| name.ends_with(e));
     Some(PlayItem {
         id: 1,
-        audio: s.inst.clone().unwrap_or_else(|| s.media.clone()),
-        video: Some(s.media.clone()),
+        audio: audio.clone(),
+        video: if audio_only { None } else { Some(audio) },
         chart: s.chart,
         artist: s.artist,
         title: s.title,
-        audio_only: ["mp3", "m4a", "ogg", "wav", "flac"]
-            .iter()
-            .any(|e| name.ends_with(e)),
+        audio_only,
         singer: "you".into(),
         tracks: vec!["P1".into()],
     })

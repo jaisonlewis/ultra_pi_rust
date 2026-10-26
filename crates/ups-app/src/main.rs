@@ -124,9 +124,8 @@ fn main() {
     );
     eprintln!("ups-app: host key {}", st.host_key);
     eprintln!("ups-app: join url {}/", lan_addr(port));
-    // mic passthrough — singers hear themselves (PipeWire only; the
-    // process dies with the app so there's nothing to clean up)
-    let _monitor = monitor::start();
+    // mic passthrough — singers hear themselves (PipeWire only)
+    let mon = monitor::start();
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -147,7 +146,16 @@ fn main() {
                 auto_next: Mutex::new(0.0),
                 native_tv,
                 paused: std::sync::atomic::AtomicBool::new(false),
+                monitor: mon,
             });
+            // the loopback's playback node lands a beat after spawn —
+            // push the stored volume/mute onto it once it exists
+            if app.monitor.is_some() {
+                let a = app.clone();
+                std::thread::spawn(move || {
+                    a.monitor.as_ref().unwrap().apply_when_ready();
+                });
+            }
             sock::register(&io, app.clone());
             let router = web::router(app.clone(), layer);
             let addr: SocketAddr = format!("{bind}:{port}").parse().unwrap();

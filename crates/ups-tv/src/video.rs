@@ -14,6 +14,9 @@ pub struct VideoPipe {
     _reader: JoinHandle<()>,
     pub fps: f64,
     pub frames: u64,
+    /// frames ffmpeg has emitted (reader-thread side) — compare against
+    /// `frames` (consumed) to see whether the decoder is ahead/behind
+    pub produced: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl VideoPipe {
@@ -41,6 +44,9 @@ impl VideoPipe {
         let stdout = child.stdout.take()?;
         let (tx, rx) = sync_channel::<Vec<u8>>(4); // ~4-frame buffer
         let frame_bytes = w * h * 3;
+        let produced =
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let produced_r = produced.clone();
         let reader = std::thread::spawn(move || {
             let mut rd = BufReader::with_capacity(frame_bytes * 2, stdout);
             loop {
@@ -48,12 +54,20 @@ impl VideoPipe {
                 if rd.read_exact(&mut buf).is_err() {
                     break; // stream ended
                 }
+                produced_r.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if tx.send(buf).is_err() {
                     break; // receiver gone
                 }
             }
         });
-        Some(VideoPipe { rx, child, _reader: reader, fps, frames: 0 })
+        Some(VideoPipe {
+            rx,
+            child,
+            _reader: reader,
+            fps,
+            frames: 0,
+            produced,
+        })
     }
 }
 
