@@ -54,9 +54,46 @@ pitch detection math, manifest + folder library discovery, audit —
   streak badges, results confetti, animated idle. `--tv` runs it
   inside `ups-app`; `ups-tv <root> <search>` plays one song standalone.
 
-Not yet: pipeline ingestion (YouTube download / normalize / vocal cut /
-chart generation — still Python-side), duet per-mic routing, autosync
+- `ups-prep` — the prep station: YouTube URL or local file →
+  normalized media, vocal-cut `.inst.mp4`, vocal stem, aligned
+  `.upsong` chart, artwork, analysis sidecar — straight into a stick
+  folder the player scans.
+
+Not yet: chart *generation* (ASR + RMVPE pitch for songs with no
+imported chart — still Python-side), duet per-mic routing, autosync
 (station charts are GAP-corrected so plain GAP works).
+
+## Prepping songs (ups-prep)
+
+```
+ups-prep <youtube-url | media-file> --library <stick root> [opts]
+  --models DIR     model dir (default ./models, $UPS_MODELS_DIR)
+  --chart FILE     import a USDB .txt or .upsong chart (auto-aligned
+                   to the media via chroma cross-correlation, baked to
+                   absolute media-ms)
+  --artist / --title   metadata overrides
+  --guide F        guide-vocal level in the karaoke mix (default .15)
+  --no-separate    skip the vocal cut
+```
+
+Produces `Library/Artist - Title/<media>` + `.inst.mp4` + `.vocals.wav`
++ `.upsong` + `.jpg` + `.analysis.json` — the same layout the Python
+pipeline writes, so folders are portable between prep stations.
+
+External tools (all cross-platform): `ffmpeg`, `ffprobe`, `yt-dlp`.
+Vocal separation additionally needs the sherpa-onnx source-separation
+binary and the spleeter int8 models:
+
+```
+# from a sherpa-onnx release (win/linux/mac + arm builds exist):
+#   bin/sherpa-onnx-offline-source-separation -> <models>/bin/
+curl -LO https://github.com/k2-fsa/sherpa-onnx/releases/download/\
+source-separation-models/sherpa-onnx-spleeter-2stems-int8.tar.bz2
+tar xjf sherpa-onnx-spleeter-2stems-int8.tar.bz2   # into <models>/
+```
+
+Without the models the pipeline still runs — media, chart, artwork,
+analysis — just no `.inst.mp4` vocal cut.
 
 ## Platforms
 
