@@ -7,7 +7,6 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::body::Body;
 use axum::extract::{Path, Query, Request, State as AxState};
 use axum::http::header;
 use axum::http::{HeaderMap, StatusCode};
@@ -412,7 +411,6 @@ async fn api_search(AxState(app): AxState<Arc<App>>,
                 || e.title.to_lowercase().contains(&query)
                 || e.artist.to_lowercase().contains(&query)
         })
-        .take(40)
         .map(|e| e.row(tops.get(&e.song_id)))
         .collect();
     Json(json!({"results": results}))
@@ -743,6 +741,7 @@ async fn api_pb_pause(AxState(app): AxState<Arc<App>>, headers: HeaderMap)
         )
             .into_response();
     }
+    app.paused.store(true, std::sync::atomic::Ordering::Relaxed);
     let _ = app.io.emit("player:pause", &Value::Null).await;
     Json(json!({"ok": true})).into_response()
 }
@@ -757,6 +756,7 @@ async fn api_pb_resume(AxState(app): AxState<Arc<App>>, headers: HeaderMap)
         )
             .into_response();
     }
+    app.paused.store(false, std::sync::atomic::Ordering::Relaxed);
     let _ = app.io.emit("player:resume", &Value::Null).await;
     Json(json!({"ok": true})).into_response()
 }

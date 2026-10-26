@@ -2281,6 +2281,7 @@ dependencies = [
  "tower",
  "tower-http",
  "ups-core",
+ "ups-tv",
 ]
 
 [[package]]
@@ -2316,6 +2317,7 @@ version = "0.0.0"
 dependencies = [
  "fontdue",
  "minifb",
+ "qrcode",
  "rodio",
  "serde_json",
  "ups-core",

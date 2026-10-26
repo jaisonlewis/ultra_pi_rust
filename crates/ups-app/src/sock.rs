@@ -30,6 +30,100 @@ pub struct App {
     pub music_volume: Mutex<f64>,
     pub mic_delay_ms: Mutex<f64>,
     pub auto_next: Mutex<f64>,
+    /// native TV renderer present → don't wait on a browser
+    pub native_tv: bool,
+    pub paused: std::sync::atomic::AtomicBool,
+}
+
+impl ups_tv::Driver for App {
+    /// Queue item → PlayItem; mirrors now_playing_payload's resolution
+    /// (instrumental preference, audio-only flag).
+    fn current(&self) -> Option<ups_tv::PlayItem> {
+        let it = self.st.now_playing().or_else(|| self.st.start_next())?;
+        let e = self
+            .st
+            .entries
+            .iter()
+            .find(|e| e.id == it.entry_id)?;
+        let want_cut = it
+            .vocal_cut
+            .map(|v| v != 0)
+            .unwrap_or(self.st.vocal_cut_default);
+        let audio = if want_cut {
+            e.inst.clone().unwrap_or_else(|| e.media.clone())
+        } else {
+            e.media.clone()
+        };
+        let p1 = self.st.performer(it.performer_id);
+        let p2 = it.performer2_id.and_then(|id| self.st.performer(id));
+        let singer = match (p1, p2) {
+            (Some(a), Some(b)) => format!("{} & {}", a.name, b.name),
+            (Some(a), None) => a.name,
+            _ => String::new(),
+        };
+        Some(ups_tv::PlayItem {
+            id: it.id,
+            audio,
+            video: Some(e.media.clone()),
+            chart: e.chart.clone(),
+            artist: e.artist.clone(),
+            title: e.title.clone(),
+            audio_only: e.audio_only,
+            singer,
+            tracks: e.tracks.clone(),
+        })
+    }
+
+    fn emit(&self, event: &str, data: &Value) {
+        let _ = self.io.broadcast().emit(event, data);
+    }
+
+    fn item_done(&self, _id: i64, score: i64) {
+        let _ = self.io.broadcast().emit(
+            "sing:final",
+            &json!({"tracks": {}, "score": score}),
+        );
+        self.st.finish_current("done", Some(score), None);
+        self.persist_and_push();
+    }
+
+    fn item_error(&self, id: i64, _msg: &str) {
+        let _ = self.io.broadcast().emit(
+            "toast",
+            &json!({"kind":"warn","text":"media error — next"}),
+        );
+        self.st.finish_current("error", None, None);
+        let _ = id;
+        self.persist_and_push();
+    }
+
+    fn paused(&self) -> bool {
+        self.paused.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn volume(&self) -> f64 {
+        *self.music_volume.lock().unwrap()
+    }
+
+    fn play_at(&self) -> f64 {
+        let Some(it) = self.st.now_playing() else { return 0.0 };
+        let mut m = self.st.play_at.lock().unwrap();
+        *m.entry(it.id)
+            .or_insert_with(|| {
+                crate::state::now_secs() + self.st.intermission_sec
+            })
+    }
+
+    fn idle_info(&self) -> (String, String) {
+        (self.join_url.clone(), self.join_url.clone())
+    }
+}
+
+impl App {
+    fn persist_and_push(&self) {
+        self.st.persist();
+        let _ = self.io.broadcast().emit("state", &self.st.snapshot());
+    }
 }
 
 /// push_now_playing() port — end the old session, promote the next
@@ -87,7 +181,9 @@ fn now_playing_payload(app: &App, item: &QueueItem) -> Value {
     } else {
         None
     };
-    let mic = if scoring {
+    // native renderer owns the mic + session; browser-TV mode spawns
+    // the sing session here instead
+    let mic = if scoring && !app.native_tv {
         begin_sing(app, item, entry)
     } else {
         false

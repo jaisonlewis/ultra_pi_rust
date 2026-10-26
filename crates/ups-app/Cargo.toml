@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 ups-core = { path = "../ups-core" }
+ups-tv = { path = "../ups-tv" }
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 socketioxide = { version = "0.18", features = ["state"] }

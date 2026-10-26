@@ -3,6 +3,7 @@
 //! drives <video> on /tv, and player:position ticks feed scoring.
 
 mod mic;
+mod monitor;
 mod sock;
 mod state;
 mod web;
@@ -55,12 +56,14 @@ fn main() {
     let mut bind = "0.0.0.0".to_string();
     let mut difficulty: i64 = 1;
     let mut intermission_sec = 30.0f64;
+    let mut native_tv = false;
     let mut vocal_cut = std::env::var("UPS_VOCAL_CUT")
         .map(|v| v != "0")
         .unwrap_or(true);
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
+            "--tv" => native_tv = true,
             "--root" | "--media" => {
                 i += 1;
                 root = PathBuf::from(&args[i]);
@@ -121,31 +124,60 @@ fn main() {
     );
     eprintln!("ups-app: host key {}", st.host_key);
     eprintln!("ups-app: join url {}/", lan_addr(port));
+    // mic passthrough — singers hear themselves (PipeWire only; the
+    // process dies with the app so there's nothing to clean up)
+    let _monitor = monitor::start();
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("tokio runtime");
-    rt.block_on(async move {
-        let join_url = lan_addr(port) + "/";
-        let (layer, io) = SocketIo::new_layer();
-        let app = Arc::new(App {
-            st,
-            io: io.clone(),
-            join_url,
-            sing: Mutex::new(None),
-            tv_sid: Mutex::new(None),
-            music_volume: Mutex::new(1.0),
-            mic_delay_ms: Mutex::new(40.0),
-            auto_next: Mutex::new(0.0),
+    std::thread::spawn(move || {
+        rt.block_on(async move {
+            let join_url = lan_addr(port) + "/";
+            let (layer, io) = SocketIo::new_layer();
+            let app = Arc::new(App {
+                st,
+                io: io.clone(),
+                join_url,
+                sing: Mutex::new(None),
+                tv_sid: Mutex::new(None),
+                music_volume: Mutex::new(1.0),
+                mic_delay_ms: Mutex::new(40.0),
+                auto_next: Mutex::new(0.0),
+                native_tv,
+                paused: std::sync::atomic::AtomicBool::new(false),
+            });
+            sock::register(&io, app.clone());
+            let router = web::router(app.clone(), layer);
+            let addr: SocketAddr = format!("{bind}:{port}").parse().unwrap();
+            let listener = tokio::net::TcpListener::bind(addr)
+                .await
+                .expect("bind");
+            eprintln!("ups-app: listening on http://{addr}  (tv: /tv)");
+            // hand the app back so the main thread can run the renderer
+            APP_SLOT.set(app).ok();
+            axum::serve(listener, router).await.expect("serve");
         });
-        sock::register(&io, app.clone());
-        let router = web::router(app, layer);
-        let addr: SocketAddr = format!("{bind}:{port}").parse().unwrap();
-        let listener = tokio::net::TcpListener::bind(addr)
-            .await
-            .expect("bind");
-        eprintln!("ups-app: listening on http://{addr}  (tv: /tv)");
-        axum::serve(listener, router).await.expect("serve");
     });
+
+    if native_tv {
+        // wait until the server thread publishes the App handle
+        let app = loop {
+            if let Some(a) = APP_SLOT.get() {
+                break a.clone();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        eprintln!("ups-app: native tv window starting");
+        ups_tv::run(app); // blocks on the kiosk loop (main thread)
+    } else {
+        // no renderer — park main thread forever
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(3600));
+        }
+    }
 }
+
+static APP_SLOT: std::sync::OnceLock<Arc<App>> = std::sync::OnceLock::new();
+

@@ -44,27 +44,38 @@ impl Text {
         })
     }
 
+    /// Advance width — same integer truncation as draw() so centering
+    /// math agrees with what's actually painted.
     pub fn width(&mut self, s: &str, px: u32) -> usize {
         s.chars()
             .map(|c| {
-                self.font.metrics(c, px as f32).advance_width as usize
+                self.font.metrics(c, px as f32).advance_width as i32
             })
-            .sum()
+            .sum::<i32>()
+            .max(0) as usize
     }
 
-    /// Draw `s` at x,y with rgb. Returns advance width used.
+    /// Draw `s` with its line-top at x,y with rgb. Returns advance used.
     pub fn draw(&mut self, fb: &mut [u32], fw: usize, fh: usize,
                 s: &str, x: i32, y: i32, px: u32, rgb: u32) -> usize {
         let mut cx = x;
         let r = ((rgb >> 16) & 0xff) as u32;
         let g = ((rgb >> 8) & 0xff) as u32;
         let b = (rgb & 0xff) as u32;
+        // ymin is the baseline→bottom-edge offset (negative = glyph
+        // descends below the baseline); bitmap top = baseline - ymin - h
+        let baseline = y
+            + self
+                .font
+                .horizontal_line_metrics(px as f32)
+                .map(|m| m.ascent.ceil() as i32)
+                .unwrap_or(px as i32);
         for ch in s.chars() {
             let adv = self.font.metrics(ch, px as f32).advance_width as i32;
             if ch != ' ' {
                 let (bmp, gw, gh, xmin, ymin) = self.glyph(ch, px).clone();
                 for gy in 0..gh {
-                    let dy = y + ymin + gy as i32;
+                    let dy = baseline - ymin - gh as i32 + gy as i32;
                     if dy < 0 || dy >= fh as i32 {
                         continue;
                     }
