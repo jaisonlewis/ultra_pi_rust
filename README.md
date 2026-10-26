@@ -11,6 +11,8 @@ crate is the intended core for native frontends.
 crates/
   ups-core/   engine library — no I/O beyond file reads, no deps but serde
   ups-cli/    command-line tool (scan / audit / info)
+  ups-play/   terminal karaoke — plays the instrumental via symphonia,
+              mic pitch via cpal, live scoring + lyric lines on stdout
 ```
 
 `ups-core` is a faithful port of the Python reference:
@@ -35,15 +37,22 @@ ups info  <file.upsong>      chart summary + perfect-run score check
 
 Working today: chart loading (both formats), the full scoring engine
 (verified numerically identical to the Python port on real charts),
-pitch detection math, manifest + folder library discovery, audit.
+pitch detection math, manifest + folder library discovery, audit —
+and `ups-play`, a terminal karaoke session: symphonia-decoded audio
+playback (mp4/aac/mp3/…), cpal mic capture, live pitch scoring and
+lyric lines.
 
-Not yet: audio/video playback, mic capture, web UI, karaoke rendering.
+Not yet: video window, web UI, karaoke pitch-lane rendering,
+autosync (the Python `sing.py` pitch/warp/whisper machinery — station
+charts are GAP-corrected already so plain GAP timing works).
+
 Next milestones, roughly:
 
-1. `ups-play` — playback via ffmpeg/gstreamer + cpal mic + live `Scorer`
-2. `ups-app` — axum server reusing the existing `web/` frontend assets
-   (the Pi's HTML/JS UI is transport-agnostic over websockets)
-3. Cross-compile to `aarch64-unknown-linux-gnu` for the Pi itself
+1. `ups-app` — axum server reusing the existing `web/` frontend assets
+   (the Pi's HTML/JS UI is transport-agnostic over websockets), with
+   video + pitch lanes
+2. Cross-compile to `aarch64-unknown-linux-gnu` for the Pi itself
+   (rodio/cpal are pure Rust + ALSA — no C toolchain gymnastics)
 
 License: GPL-3.0 (matching the source project and the WorldParty code
 it ports).

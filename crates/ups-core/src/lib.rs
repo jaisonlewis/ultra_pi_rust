@@ -7,6 +7,7 @@ pub mod chart;
 pub mod layout;
 pub mod pitch;
 pub mod scoring;
+pub mod session;
 
 pub use catalog::{scan, read_manifest, scan_folders, SongRec};
 pub use chart::{load_chart, parse_chart, Chart, Note, Phrase};
