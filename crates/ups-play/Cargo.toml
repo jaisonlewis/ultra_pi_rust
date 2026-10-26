@@ -7,5 +7,4 @@ license.workspace = true
 [dependencies]
 ups-core = { path = "../ups-core" }
 rodio = "0.20"
-symphonia = { version = "0.5", features = ["all"] }
 cpal = "0.15"

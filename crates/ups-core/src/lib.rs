@@ -2,8 +2,10 @@
 //! Star frontend (Pi, Switch, desktop). Ports of the Python reference
 //! implementation under `ultrapistar/`; GPL-3.0.
 
+pub mod capture;
 pub mod catalog;
 pub mod chart;
+pub mod decode;
 pub mod layout;
 pub mod pitch;
 pub mod scoring;

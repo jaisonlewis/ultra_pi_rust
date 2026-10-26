@@ -58,7 +58,7 @@ pub struct Syl {
     pub e: i64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Chart {
     pub headers: BTreeMap<String, String>,
     pub tracks: BTreeMap<String, Vec<Note>>,

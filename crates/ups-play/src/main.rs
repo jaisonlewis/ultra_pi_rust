@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-mod decode;
+use ups_core::decode;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use rodio::{OutputStream, Sink, Source};

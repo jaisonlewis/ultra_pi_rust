@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/ups-core", "crates/ups-cli", "crates/ups-play", "crates/ups-app"]
+members = ["crates/ups-core", "crates/ups-cli", "crates/ups-play", "crates/ups-app", "crates/ups-tv"]
 
 [workspace.package]
 edition = "2021"
