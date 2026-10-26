@@ -31,7 +31,7 @@ fn cmd_scan(root: Option<PathBuf>) {
     let Some(root) = root else { return usage() };
     let songs = catalog::scan(&root);
     for s in &songs {
-        let badge = if s.is_complete(&root) { "" } else { "  [incomplete]" };
+        let badge = if s.is_complete() { "" } else { "  [incomplete]" };
         println!("{} - {}{}", s.artist, s.title, badge);
     }
     println!("{} songs", songs.len());
@@ -43,31 +43,26 @@ fn cmd_audit(root: Option<PathBuf>) {
     let mut bad = 0;
     for s in &songs {
         let mut issues = Vec::new();
-        let media = root.join(&s.local_path);
-        if s.local_path.is_empty() || !media.is_file() {
-            issues.push("media missing");
-        } else {
-            let (d, stem) = (
-                media.parent().map(|p| p.to_path_buf()).unwrap_or_default(),
-                media.file_stem().unwrap_or_default().to_string_lossy().to_string(),
-            );
-            if !d.join(format!("{stem}.inst.mp4")).is_file() {
-                issues.push("no inst");
-            }
-            if !d.join(format!("{stem}.vocals.wav")).is_file() {
-                issues.push("no vocals stem");
-            }
-            if !d.join(format!("{stem}.analysis.json")).is_file() {
-                issues.push("no analysis sidecar");
-            }
-            if ![".jpg", ".png", ".jpeg"].iter()
-                .any(|e| d.join(format!("{stem}{e}")).is_file())
-            {
-                issues.push("no artwork");
-            }
+        let media = &s.media;
+        let stem = media.file_stem().unwrap_or_default()
+            .to_string_lossy().to_string();
+        let d = &s.dir;
+        if !d.join(format!("{stem}.inst.mp4")).is_file() {
+            issues.push("no inst");
+        }
+        if !d.join(format!("{stem}.vocals.wav")).is_file()
+            && !d.join(format!("{stem}.vocals.mp3")).is_file()
+        {
+            issues.push("no vocals stem");
+        }
+        if !d.join(format!("{stem}.analysis.json")).is_file() {
+            issues.push("no analysis sidecar");
+        }
+        if s.art.is_none() {
+            issues.push("no artwork");
         }
         // chart must exist and parse with notes
-        let ch = s.chart_path(&root).filter(|p| p.is_file());
+        let ch = s.chart.clone().filter(|p| p.is_file());
         match ch {
             None => issues.push("no chart"),
             Some(p) => {

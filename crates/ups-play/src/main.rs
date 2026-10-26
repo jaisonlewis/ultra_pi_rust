@@ -15,7 +15,7 @@ use std::time::Duration;
 mod decode;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use rodio::{buffer::SamplesBuffer, OutputStream, Sink};
+use rodio::{OutputStream, Sink, Source};
 use ups_core::{catalog, chart, pitch, session};
 
 fn main() {
@@ -25,18 +25,21 @@ fn main() {
         return;
     };
     let path = PathBuf::from(first);
-    let dir = if path.is_dir() && args.len() == 1 {
-        path
+    let (dir, mut media, mut chart_path) = if path.is_dir() && args.len() == 1 {
+        (path, None, None)
     } else {
-        // catalog search
+        // catalog search — the resolver already located every file
         let needle = args.get(1).cloned().unwrap_or_default().to_lowercase();
         let songs = catalog::scan(&path);
         let hit = songs.iter().find(|s| {
             format!("{} {}", s.artist, s.title).to_lowercase().contains(&needle)
         });
         match hit {
-            Some(s) => PathBuf::from(&path).join(&s.local_path)
-                .parent().unwrap().to_path_buf(),
+            Some(s) => (
+                s.dir.clone(),
+                Some(s.inst.clone().unwrap_or_else(|| s.media.clone())),
+                s.chart.clone(),
+            ),
             None => {
                 eprintln!("no match for '{needle}'");
                 return;
@@ -45,14 +48,12 @@ fn main() {
     };
 
     // media: prefer the instrumental, fall back to the original
-    let mut media = None;
-    let mut chart_path = None;
     if let Ok(rd) = std::fs::read_dir(&dir) {
         for f in rd.flatten() {
             let name = f.file_name().to_string_lossy().to_lowercase();
-            if name.ends_with(".inst.mp4") {
+            if media.is_none() && name.ends_with(".inst.mp4") {
                 media = Some(f.path());
-            } else if name.ends_with(".upsong") && chart_path.is_none() {
+            } else if chart_path.is_none() && name.ends_with(".upsong") {
                 chart_path = Some(f.path());
             }
         }
@@ -79,69 +80,93 @@ fn main() {
              c.artist(), c.title(), c.bpm(), c.gap_ms());
 
     // ---- audio out ------------------------------------------------------
-    let (_stream, handle) = match OutputStream::try_default() {
-        Ok(v) => v,
-        Err(e) => { eprintln!("no audio output: {e}"); return; }
+    // cpal's "default" can resolve to an unplugged/dmix-blocked device
+    // (e.g. a desktop session where pipewire owns the card) — walk the
+    // enumerated devices until one actually opens.
+    let mut out = OutputStream::try_default().ok();
+    if out.is_none() {
+        if let Ok(devs) = cpal::default_host().output_devices() {
+            for dev in devs {
+                if let Ok(v) = OutputStream::try_from_device(&dev) {
+                    println!("audio out: {}", dev.name().unwrap_or_default());
+                    out = Some(v);
+                    break;
+                }
+            }
+        }
+    }
+    let Some((_stream, handle)) = out else {
+        eprintln!("no audio output");
+        return;
     };
-    let (pcm, channels, rate) = match decode::decode_audio(&media) {
+    let src = match decode::StreamingSource::open(&media) {
         Ok(v) => v,
         Err(e) => { eprintln!("decode failed: {e}"); return; }
     };
-    let dur_s = pcm.len() as f64 / channels as f64 / rate as f64;
-    println!("decoded {} ({}ch @ {}Hz, {:.0}s)", media.display(),
-             channels, rate, dur_s);
-    let file = SamplesBuffer::new(channels, rate, pcm);
+    let dur_s = src.duration().unwrap_or(0.0);
+    println!("streaming {} ({}ch @ {}Hz, {:.0}s)", media.display(),
+             src.channels(), src.sample_rate(), dur_s);
     let sink = match Sink::try_new(&handle) {
         Ok(s) => s,
         Err(e) => { eprintln!("sink: {e}"); return; }
     };
-    sink.append(file);
+    sink.append(src);
 
     // ---- mic -------------------------------------------------------------
     let shared = Arc::new(Mutex::new(VecDeque::<i16>::with_capacity(8192)));
     let host = cpal::default_host();
-    let (det_rate, _mic_stream) = match host.default_input_device() {
-        Some(dev) => {
-            let cfg = dev.default_input_config()
-                .expect("default input config");
-            let rate = cfg.sample_rate().0;
-            let err_fn = |e: cpal::StreamError| eprintln!("mic error: {e}");
-            let cfg_stream: cpal::StreamConfig = cfg.clone().into();
-            let stream = match cfg.sample_format() {
-                cpal::SampleFormat::I16 => {
-                    let buf = Arc::clone(&shared);
-                    dev.build_input_stream(
-                        &cfg_stream,
-                        move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                            let mut g = buf.lock().unwrap();
-                            g.extend(data.iter().copied());
-                            while g.len() > 8192 { g.pop_front(); }
-                        },
-                        err_fn, None)
-                }
-                cpal::SampleFormat::F32 => {
-                    let buf = Arc::clone(&shared);
-                    dev.build_input_stream(
-                        &cfg_stream,
-                        move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                            let mut g = buf.lock().unwrap();
-                            g.extend(data.iter().map(|&s|
-                                (s.clamp(-1.0, 1.0) * 32767.0) as i16));
-                            while g.len() > 8192 { g.pop_front(); }
-                        },
-                        err_fn, None)
-                }
-                _ => panic!("unsupported mic format"),
-            }.expect("input stream");
-            stream.play().expect("mic start");
-            println!("mic: {} @ {} Hz", dev.name().unwrap_or_default(), rate);
-            (rate, Some(stream))
-        }
-        None => {
+    let open_mic = |dev: &cpal::Device| {
+        let cfg = dev.default_input_config().ok()?;
+        let rate = cfg.sample_rate().0;
+        let err_fn = |e: cpal::StreamError| eprintln!("mic error: {e}");
+        let cfg_stream: cpal::StreamConfig = cfg.clone().into();
+        let stream = match cfg.sample_format() {
+            cpal::SampleFormat::I16 => {
+                let buf = Arc::clone(&shared);
+                dev.build_input_stream(
+                    &cfg_stream,
+                    move |data: &[i16], _: &cpal::InputCallbackInfo| {
+                        let mut g = buf.lock().unwrap();
+                        g.extend(data.iter().copied());
+                        while g.len() > 8192 { g.pop_front(); }
+                    },
+                    err_fn, None)
+            }
+            cpal::SampleFormat::F32 => {
+                let buf = Arc::clone(&shared);
+                dev.build_input_stream(
+                    &cfg_stream,
+                    move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                        let mut g = buf.lock().unwrap();
+                        g.extend(data.iter().map(|&s|
+                            (s.clamp(-1.0, 1.0) * 32767.0) as i16));
+                        while g.len() > 8192 { g.pop_front(); }
+                    },
+                    err_fn, None)
+            }
+            _ => return None,
+        }.ok()?;
+        stream.play().ok()?;
+        Some((rate, stream))
+    };
+    // the "default" input can be playback-only (asym) — walk devices
+    // until one actually opens for capture
+    let (det_rate, _mic_stream) = host.input_devices()
+        .ok()
+        .and_then(|mut devs| {
+            devs.find_map(|dev| {
+                open_mic(&dev).map(|(rate, stream)| {
+                    println!("mic: {} @ {} Hz",
+                             dev.name().unwrap_or_default(), rate);
+                    (rate, stream)
+                })
+            })
+        })
+        .map(|(r, s)| (r, Some(s)))
+        .unwrap_or_else(|| {
             println!("no mic — playback only");
             (44100, None)
-        }
-    };
+        });
     let mut det = pitch::PitchDetector::new(det_rate, 2);
     let mut sess = session::Session::new(c, "P1", 0, true);
 

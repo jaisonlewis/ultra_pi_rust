@@ -1,7 +1,13 @@
 //! Library catalog — reads the station/Pi manifest and falls back to
-//! the two-level `artist/title/` folder scan the Switch uses, so a
-//! Rust app and the other frontends see the same library.
+//! a folder scan, so a Rust app and the other frontends see the same
+//! library.
+//!
+//! Resolution mirrors the Switch's `catalog.cpp`: manifest paths are
+//! root-relative, but prepared sticks also carry the legacy flat layout
+//! (`Artist - Title/` dirs + bare filenames + `charts/` dir), so every
+//! path resolves through a chain of fallbacks.
 
+use crate::layout;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
@@ -29,51 +35,227 @@ pub struct SongRec {
     pub provenance: String,
 }
 
-impl SongRec {
-    /// True when the cluster a record points at is complete enough to
-    /// sing: media + karaoke backing + a chart.
-    pub fn is_complete(&self, root: &Path) -> bool {
-        let media_ok = !self.local_path.is_empty()
-            && root.join(&self.local_path).is_file();
-        let inst_ok = !self.inst_path.is_empty()
-            && root.join(&self.inst_path).is_file();
-        media_ok && inst_ok
-    }
-    pub fn media_path(&self, root: &Path) -> PathBuf {
-        root.join(&self.local_path)
-    }
-    pub fn inst_media(&self, root: &Path) -> PathBuf {
-        root.join(&self.inst_path)
-    }
-    pub fn chart_path(&self, root: &Path) -> Option<PathBuf> {
-        if self.chart.is_empty() {
-            None
-        } else {
-            Some(root.join(&self.chart))
-        }
+/// A catalog song with every path resolved to disk.
+#[derive(Debug, Clone)]
+pub struct Song {
+    pub artist: String,
+    pub title: String,
+    pub provider: String,
+    pub source_id: String,
+    pub dir: PathBuf,
+    pub media: PathBuf,
+    pub inst: Option<PathBuf>,
+    pub chart: Option<PathBuf>,
+    pub art: Option<PathBuf>,
+    pub duration_sec: Option<f64>,
+}
+
+impl Song {
+    /// Complete enough to sing: media + karaoke backing + a chart.
+    pub fn is_complete(&self) -> bool {
+        self.inst.is_some() && self.chart.is_some()
     }
 }
 
-const MEDIA_EXTS: [&str; 5] = [".mp4", ".mp3", ".m4a", ".webm", ".mkv"];
-const SKIP_DIRS: [&str; 4] = ["incomplete", "_unsorted", "_removed", "_removed_peers"];
+const MEDIA_EXTS: [&str; 8] = [
+    ".mp4", ".mp3", ".m4a", ".webm", ".mkv", ".ogg", ".wav", ".flac",
+];
+const SKIP_DIRS: [&str; 6] = [
+    "incomplete", "_unsorted", "_removed", "_removed_peers",
+    "charts", "chart-library",
+];
+const ART_NAMES: [&str; 5] = [
+    "cover.jpg", "cover.png", "cover.jpeg", "folder.jpg", "artwork.jpg",
+];
+
+fn file_name(p: &Path) -> String {
+    p.file_name().unwrap_or_default().to_string_lossy().to_lowercase()
+}
+
+fn stem_of(name: &str) -> &str {
+    name.rsplit_once('.').map(|(s, _)| s).unwrap_or(name)
+}
+
+/// Download fragments, pipeline intermediates, yt-dlp per-format
+/// leftovers (yt-<id>.f140.m4a) — never a song.
+fn is_junk(stem: &str, ext: &str) -> bool {
+    if stem.contains(".part")
+        || stem.contains(".temp")
+        || stem.contains(".vocals")
+        || ext == ".ytdl"
+    {
+        return true;
+    }
+    match stem.rfind(".f") {
+        Some(p) => {
+            stem.len() > p + 2 && stem.as_bytes()[p + 2].is_ascii_digit()
+        }
+        None => false,
+    }
+}
 
 fn is_source_media(p: &Path) -> bool {
     if !p.is_file() {
         return false;
     }
-    let name = match p.file_name().and_then(|n| n.to_str()) {
-        Some(n) => n.to_lowercase(),
-        None => return false,
-    };
-    if name.contains(".inst.") || name.ends_with(".vocals.wav") {
-        return false;
-    }
-    // yt-dlp per-format fragments: yt-<id>.f140.m4a
-    let stem = name.rsplitn(2, '.').nth(1).unwrap_or("");
-    if stem.contains(".f") && stem.rsplit(".f").next().map(|s| s.chars().all(|c| c.is_ascii_digit())).unwrap_or(false) {
+    let name = file_name(p);
+    let ext = name.rsplit_once('.').map(|(_, e)| format!(".{e}")).unwrap_or_default();
+    if name.ends_with(".inst.mp4")
+        || name.ends_with(".vocals.wav")
+        || is_junk(stem_of(&name), &ext)
+    {
         return false;
     }
     MEDIA_EXTS.iter().any(|e| name.ends_with(e))
+}
+
+fn is_inst(p: &Path) -> bool {
+    file_name(p).ends_with(".inst.mp4")
+}
+
+fn list_dir(dir: &Path, dirs_only: bool) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten()
+                .map(|f| f.path())
+                .filter(|p| {
+                    if p.file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|n| n.starts_with('.'))
+                        .unwrap_or(true)
+                    {
+                        return false;
+                    }
+                    if dirs_only {
+                        p.is_dir()
+                    } else {
+                        p.is_file()
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    out.sort();
+    out
+}
+
+/// Pick media + instrumental from a dir, optionally pinned to one stem.
+/// Mirrors the Switch's `pickMedia`.
+fn pick_media(dir: &Path, want_stem: &str) -> Option<(PathBuf, Option<PathBuf>)> {
+    let mut media = None;
+    let mut inst = None;
+    for p in list_dir(dir, false) {
+        let name = file_name(&p);
+        let st = stem_of(&name).to_string();
+        if is_inst(&p) {
+            if inst.is_none() {
+                inst = Some(p);
+            }
+            continue;
+        }
+        if !is_source_media(&p) {
+            continue;
+        }
+        if !want_stem.is_empty() && st != want_stem {
+            continue;
+        }
+        if media.is_none() {
+            media = Some(p);
+        }
+    }
+    media.map(|m| (m, inst))
+}
+
+/// Artwork lookup: per-song sidecar first, then folder art names.
+/// Mirrors the Switch's `findArt`.
+fn find_art(dir: &Path, media_stem: &str) -> Option<PathBuf> {
+    if !media_stem.is_empty() {
+        for e in [".jpg", ".png", ".jpeg"] {
+            let p = dir.join(format!("{media_stem}{e}"));
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+    for n in ART_NAMES {
+        let p = dir.join(n);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+fn find_charts_rec(dir: &Path, want: &str, depth: u32) -> Option<PathBuf> {
+    if depth > 4 {
+        return None;
+    }
+    for p in list_dir(dir, false) {
+        if p.extension().map(|e| e == "upsong").unwrap_or(false)
+            && stem_of(&file_name(&p)) == want
+        {
+            return Some(p);
+        }
+    }
+    for p in list_dir(dir, true) {
+        if let Some(found) = find_charts_rec(&p, want, depth + 1) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// Chart resolution, mirroring the Switch's `findChart` plus the
+/// manifest-declared path and the `charts/<Artist - Title>.upsong`
+/// convention the prepared-stick layout uses.
+fn find_chart(root: &Path, dir: &Path, media_stem: &str,
+              folder_name: &str) -> Option<PathBuf> {
+    let p = dir.join(format!("{media_stem}.upsong"));
+    if p.is_file() {
+        return Some(p);
+    }
+    // a one-song folder holds its own chart
+    for f in list_dir(dir, false) {
+        if f.extension().map(|e| e == "upsong").unwrap_or(false) {
+            return Some(f);
+        }
+    }
+    // prepared sticks: charts/<Artist - Title>.upsong
+    let p = root.join("charts").join(format!("{folder_name}.upsong"));
+    if p.is_file() {
+        return Some(p);
+    }
+    // recursive hunt under the root (charts/, chart-library/)
+    find_charts_rec(root, media_stem, 0)
+        .or_else(|| find_charts_rec(root, folder_name, 0))
+}
+
+/// `Artist - Title` folder name → (artist, title). A name without the
+/// separator lands entirely on title.
+fn split_folder(name: &str) -> (String, String) {
+    match name.find(" - ") {
+        Some(pos) => (name[..pos].to_string(), name[pos + 3..].to_string()),
+        None => (String::new(), name.to_string()),
+    }
+}
+
+/// snake_case slug → "Title Case" for display on manifest-less sticks.
+fn unslug(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut cap = true;
+    for mut c in s.chars() {
+        if c == '_' || c == '-' {
+            c = ' ';
+            cap = true;
+        } else if cap && c.is_ascii_lowercase() {
+            c = c.to_ascii_uppercase();
+            cap = false;
+        } else if c != ' ' {
+            cap = false;
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Read `<root>/manifest.json` (station/Pi catalog format).
@@ -94,86 +276,229 @@ pub fn read_manifest(root: &Path) -> Vec<SongRec> {
     serde_json::from_value(arr).unwrap_or_default()
 }
 
-/// Fallback: walk `<artist>/<title>/` folders for media (what the
-/// Switch does when no manifest exists). Skips scratch/quarantine
-/// subtrees.
-pub fn scan_folders(root: &Path) -> Vec<SongRec> {
-    let mut out = Vec::new();
-    let Ok(rd) = std::fs::read_dir(root) else {
-        return out;
-    };
-    for artist in rd.flatten() {
-        let adir = artist.path();
-        if !adir.is_dir() {
-            continue;
+/// Resolve one manifest record to on-disk paths. Returns None when no
+/// media file can be found anywhere the record points.
+fn resolve_rec(root: &Path, rec: &SongRec) -> Option<Song> {
+    if rec.local_path.is_empty() {
+        return None;
+    }
+    let folder_name = layout::song_folder(&rec.artist, &rec.title, "");
+    let want_stem = stem_of(
+        &Path::new(&rec.local_path)
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy(),
+    )
+    .to_string();
+
+    // media: root-relative path first (station's two-level layout)
+    let full = root.join(&rec.local_path);
+    let (dir, media, mut inst) = if full.is_file() {
+        let dir = full.parent().unwrap_or(root).to_path_buf();
+        let inst = {
+            let i = dir.join(format!("{want_stem}.inst.mp4"));
+            if i.is_file() { Some(i) } else { None }
+        };
+        (dir, full.clone(), inst)
+    } else {
+        // the manifest names an exact file — trust it even when its
+        // stem looks like a fragment (`.f140.m4a`, `.temp.mp4`);
+        // is_junk filtering is for unguided scans only
+        let base = Path::new(&rec.local_path)
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let exact = |d: &Path| {
+            let m = d.join(&base);
+            if m.is_file() {
+                let i = d.join(format!("{want_stem}.inst.mp4"));
+                Some((d.to_path_buf(), m,
+                      if i.is_file() { Some(i) } else { None }))
+            } else {
+                None
+            }
+        };
+        // declared dir (nested rel_path), then the flat
+        // 'Artist - Title/' stick layout
+        let declared = full.parent().unwrap_or(root).to_path_buf();
+        let flat = root.join(&folder_name);
+        let mut picked = exact(&declared)
+            .or_else(|| pick_media(&declared, &want_stem)
+                .map(|(m, i)| (declared.clone(), m, i)))
+            .or_else(|| exact(&flat))
+            .or_else(|| pick_media(&flat, &want_stem)
+                .or_else(|| pick_media(&flat, ""))
+                .map(|(m, i)| (flat.clone(), m, i)));
+        if picked.is_none() {
+            // dir name may predate the current song_folder naming —
+            // last resort: whichever one-level subdir holds the file
+            for d in list_dir(root, true) {
+                if let Some(p) = exact(&d) {
+                    picked = Some(p);
+                    break;
+                }
+            }
         }
-        let aname = artist.file_name().to_string_lossy().to_string();
+        picked?
+    };
+
+    // manifest-declared inst_path can point elsewhere
+    if !rec.inst_path.is_empty() {
+        let p = root.join(&rec.inst_path);
+        if p.is_file() {
+            inst = Some(p);
+        } else {
+            let flat = dir.join(
+                Path::new(&rec.inst_path).file_name().unwrap_or_default(),
+            );
+            if flat.is_file() {
+                inst = Some(flat);
+            }
+        }
+    }
+
+    let mut chart = if rec.chart.is_empty() {
+        None
+    } else {
+        let p = root.join(&rec.chart);
+        if p.is_file() {
+            Some(p)
+        } else {
+            let flat = root.join("charts").join(
+                Path::new(&rec.chart).file_name().unwrap_or_default(),
+            );
+            if flat.is_file() { Some(flat) } else { None }
+        }
+    };
+    if chart.is_none() {
+        chart = find_chart(root, &dir, &want_stem, &folder_name);
+    }
+
+    let art = if rec.art.is_empty() {
+        None
+    } else {
+        let p = root.join(&rec.art);
+        if p.is_file() { Some(p) } else { None }
+    }
+    .or_else(|| find_art(&dir, &want_stem));
+
+    Some(Song {
+        artist: rec.artist.clone(),
+        title: rec.title.clone(),
+        provider: rec.provider.clone(),
+        source_id: rec.source_id.clone(),
+        dir,
+        media,
+        inst,
+        chart,
+        art,
+        duration_sec: rec.duration_sec,
+    })
+}
+
+/// Fallback: walk song folders for media. `Artist - Title/` one-level
+/// (prepared sticks), `artist/title/` two-level (station output) and
+/// flat root files all resolve — the same set the Switch scans.
+pub fn scan_folders(root: &Path) -> Vec<Song> {
+    let mut out = Vec::new();
+    let song = |dir: PathBuf, artist: String, title: String| {
+        let (media, inst) = pick_media(&dir, "")?;
+        let mstem = stem_of(&file_name(&media)).to_string();
+        let folder = dir
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        Some(Song {
+            provider: if mstem.starts_with("yt-") {
+                "youtube".into()
+            } else {
+                "local".into()
+            },
+            source_id: mstem.strip_prefix("yt-").unwrap_or(&mstem).into(),
+            chart: find_chart(root, &dir, &mstem, &folder),
+            art: find_art(&dir, &mstem),
+            artist,
+            title,
+            dir,
+            media,
+            inst,
+            duration_sec: None,
+        })
+    };
+    for adir in list_dir(root, true) {
+        let aname = adir
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
         if SKIP_DIRS.contains(&aname.as_str()) {
             continue;
         }
-        let Ok(td) = std::fs::read_dir(&adir) else {
+        // one-level 'Artist - Title/' song dir?
+        if pick_media(&adir, "").is_some() {
+            let (a, t) = split_folder(&aname);
+            if let Some(s) = song(adir, a, t) {
+                out.push(s);
+            }
             continue;
-        };
-        for title in td.flatten() {
-            let tdir = title.path();
-            if !tdir.is_dir() {
+        }
+        // two-level artist/title/ layout
+        for tdir in list_dir(&adir, true) {
+            if pick_media(&tdir, "").is_none() {
                 continue;
             }
-            let Ok(files) = std::fs::read_dir(&tdir) else {
-                continue;
-            };
-            let mut media: Option<PathBuf> = None;
-            let mut chart: Option<PathBuf> = None;
-            for f in files.flatten() {
-                let p = f.path();
-                if is_source_media(&p) && media.is_none() {
-                    media = Some(p.clone());
-                }
-                if p.extension().map(|e| e == "upsong").unwrap_or(false) && chart.is_none() {
-                    chart = Some(p);
-                }
-            }
-            if let Some(m) = media {
-                let tname = title.file_name().to_string_lossy().to_string();
-                let stem = m.file_stem().unwrap_or_default().to_string_lossy().to_string();
-                let rel = |p: &Path| {
-                    p.strip_prefix(root)
-                        .unwrap_or(p)
-                        .to_string_lossy()
-                        .replace('\\', "/")
-                };
-                let inst = m.with_file_name(format!("{}.inst.mp4", stem));
-                out.push(SongRec {
-                    artist: aname.replace('_', " "),
-                    title: tname.replace('_', " "),
-                    provider: if stem.starts_with("yt-") {
-                        "youtube".into()
-                    } else {
-                        "local".into()
-                    },
-                    source_id: stem.strip_prefix("yt-").unwrap_or(&stem).to_string(),
-                    local_path: rel(&m),
-                    inst_path: if inst.is_file() { rel(&inst) } else { String::new() },
-                    art: {
-                        let j = m.with_file_name(format!("{}.jpg", stem));
-                        if j.is_file() { rel(&j) } else { String::new() }
-                    },
-                    chart: chart.map(|c| rel(&c)).unwrap_or_default(),
-                    duration_sec: None,
-                    provenance: "folder-scan".into(),
-                });
+            let tname = tdir
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            if let Some(s) = song(tdir, unslug(&aname), unslug(&tname)) {
+                out.push(s);
             }
         }
+    }
+    // flat root media files (un-organized prepared roots)
+    for p in list_dir(root, false) {
+        if !is_source_media(&p) {
+            continue;
+        }
+        let st = stem_of(&file_name(&p)).to_string();
+        let (a, t) = split_folder(&st);
+        out.push(Song {
+            title: if t.is_empty() { st.clone() } else { t },
+            artist: a,
+            provider: if st.starts_with("yt-") {
+                "youtube".into()
+            } else {
+                "local".into()
+            },
+            source_id: st.strip_prefix("yt-").unwrap_or(&st).into(),
+            dir: root.to_path_buf(),
+            media: p.clone(),
+            inst: {
+                let i = root.join(format!("{st}.inst.mp4"));
+                if i.is_file() { Some(i) } else { None }
+            },
+            chart: find_chart(root, root, &st, &st),
+            art: find_art(root, &st),
+            duration_sec: None,
+        });
     }
     out
 }
 
 /// Manifest records if present, else the folder scan — the same order
 /// the Pi/Switch resolve a library.
-pub fn scan(root: &Path) -> Vec<SongRec> {
-    let m = read_manifest(root);
-    if !m.is_empty() {
-        return m;
+pub fn scan(root: &Path) -> Vec<Song> {
+    let recs = read_manifest(root);
+    if !recs.is_empty() {
+        let songs: Vec<Song> =
+            recs.iter().filter_map(|r| resolve_rec(root, r)).collect();
+        if !songs.is_empty() {
+            return songs;
+        }
     }
     scan_folders(root)
 }
