@@ -24,6 +24,12 @@ pub struct Monitor {
 /// Spawn the loopback. Returns None where PipeWire tools don't exist
 /// (dev machines) — scoring capture keeps working without it.
 pub fn start() -> Option<Monitor> {
+    // orphaned loopbacks from previous runs survive us — they double
+    // the monitored mic and pile up ~8 MB each. Our own argv doesn't
+    // contain "ups-monitor" so this can't self-match.
+    let _ = Command::new("pkill")
+        .args(["-f", "pw-loopback.*ups-monitor"])
+        .status();
     let child = Command::new("pw-loopback")
         .args(["-n", "ups-monitor", "-c", "1", "-l", "10"])
         .stdin(Stdio::null())
