@@ -20,6 +20,5 @@ anyhow = "1"
 ort = "2.0.0-rc.15"
 unicode-normalization = "0.1"
 unicode_categories = "0.1"
-eframe = { version = "0.32", optional = true, default-features = false,
-           features = ["default_fonts", "glow", "wayland", "x11"] }
+eframe = { version = "0.32", optional = true, default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 rfd = { version = "0.15", optional = true }
