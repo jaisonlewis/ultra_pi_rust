@@ -14,8 +14,12 @@ mod align;
 mod artwork;
 mod asr;
 mod ff;
+mod genchart;
 mod lyrics;
+mod mel;
+mod rmvpe;
 mod separate;
+mod wordmap;
 
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
@@ -221,6 +225,75 @@ fn main() -> Result<()> {
                    skipping vocal cut", args.models.display());
     }
 
+    // ASR — word onsets for chart generation + lyric anchoring.
+    // Vocal stem first; full media when the stem won't transcribe.
+    let mut asr_words: Vec<asr::AsrWord> = Vec::new();
+    if asr::have_models(&args.models) {
+        stage("transcribing (asr)");
+        let voc = stem_path("vocals.wav");
+        let stem = voc.exists().then_some(voc.as_path());
+        match asr::transcribe_media(&media, stem, &args.models) {
+            Ok(w) => {
+                println!("asr: {} words", w.len());
+                asr_words = w;
+            }
+            Err(e) => eprintln!("asr failed: {e}"),
+        }
+    }
+
+    // lyrics — gather candidate records, keep the one whose text best
+    // matches what the ASR actually heard (LRCLIB stubs and same-title
+    // different songs lose on word coverage, not on ordering)
+    stage("fetching lyrics");
+    let dur = ff::duration(&media).ok();
+    let mut recs: Vec<lyrics::LyricRecord> = Vec::new();
+    let mut seen: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let push_rec = |r: Option<lyrics::LyricRecord>,
+                        recs: &mut Vec<lyrics::LyricRecord>,
+                        seen: &mut std::collections::HashSet<String>| {
+        if let Some(r) = r {
+            let key = format!("{}|{}", r.artist_name, r.track_name);
+            if seen.insert(key) {
+                recs.push(r);
+            }
+        }
+    };
+    for (a, t) in lyrics::yt_candidates(&artist, &title) {
+        push_rec(lyrics::fetch(&a, &t, dur), &mut recs, &mut seen);
+    }
+    let q = format!("{artist} {title}").trim().to_string();
+    for r in lyrics::search(&q, dur) {
+        push_rec(Some(r), &mut recs, &mut seen);
+    }
+    let asr_norm: Vec<(String, f64)> = wordmap::norm_asr(
+        &asr_words.iter()
+            .map(|w| (w.word.clone(), w.start_ms, w.end_ms))
+            .collect::<Vec<_>>());
+    let rec = recs.into_iter()
+        .map(|r| {
+            let lines: Vec<String> = if r.synced.is_empty() {
+                r.plain.clone()
+            } else {
+                r.synced.iter().map(|(_, t)| t.clone()).collect()
+            };
+            let sp = wordmap::map_line_words(&asr_norm, &lines);
+            let used: usize = sp.values()
+                .map(|s| s.words.len()).sum();
+            (used, r)
+        })
+        .max_by_key(|(u, _)| *u)
+        .filter(|(u, _)| *u >= 3)
+        .map(|(_, r)| r);
+    if let Some(r) = &rec {
+        println!("lyrics: {} synced / {} plain lines \
+                  ({} — {})",
+                 r.synced.len(), r.plain.len(),
+                 r.artist_name, r.track_name);
+    } else {
+        println!("lyrics: none found");
+    }
+
     // phase 2 — chart: import + chroma-align to THIS media, then bake
     // to absolute media-ms so the player needs no warp machinery
     if let Some(chart_path) = &args.chart {
@@ -250,41 +323,9 @@ fn main() -> Result<()> {
         }
         let n: usize = chart.tracks.values().map(|v| v.len()).sum();
         println!("chart: {n} notes → {}", dest.display());
-    }
-
-    // ASR — word onsets for chart generation + lyric anchoring.
-    // Prefer the 16k vocal stem; fall back to full-media audio.
-    let mut asr_words: Vec<asr::AsrWord> = Vec::new();
-    if asr::have_models(&args.models) {
-        stage("transcribing (asr)");
-        let voc = stem_path("vocals.wav");
-        let stem = voc.exists().then_some(voc.as_path());
-        match asr::transcribe_media(&media, stem, &args.models) {
-            Ok(w) => {
-                println!("asr: {} words", w.len());
-                asr_words = w;
-            }
-            Err(e) => eprintln!("asr failed: {e}"),
-        }
-    }
-
-    // lyrics + artwork
-    stage("fetching lyrics");
-    let dur = ff::duration(&media).ok();
-    let rec = lyrics::yt_candidates(&artist, &title)
-        .into_iter()
-        .find_map(|(a, t)| lyrics::fetch(&a, &t, dur))
-        .or_else(|| {
-            let q = format!("{artist} {title}").trim().to_string();
-            lyrics::search(&q, dur).into_iter().next()
-        });
-    if let Some(r) = &rec {
-        println!("lyrics: {} synced / {} plain lines \
-                  ({} — {})",
-                 r.synced.len(), r.plain.len(),
-                 r.artist_name, r.track_name);
     } else {
-        println!("lyrics: none found");
+        gen_chart(&args, &media, &artist, &title, &asr_words,
+                  &stem_path("upsong"), rec.as_ref());
     }
 
     stage("fetching artwork");
@@ -324,4 +365,79 @@ fn main() -> Result<()> {
     let _ = std::fs::remove_dir_all(&dl_dir);
     println!("done → {}", folder.display());
     Ok(())
+}
+
+/// Generate a chart from ASR word onsets + RMVPE pitch on the vocal
+/// stem (or raw media when no stem exists).
+fn gen_chart(args: &Args, media: &Path, artist: &str, title: &str,
+             asr_words: &[asr::AsrWord], dest: &Path,
+             rec: Option<&lyrics::LyricRecord>) {
+    if asr_words.len() < 20 {
+        eprintln!("chart: too few asr words ({}) — need an imported \
+                   chart or better audio", asr_words.len());
+        return;
+    }
+    let asr: Vec<(String, f64)> = wordmap::norm_asr(
+        &asr_words.iter()
+            .map(|w| (w.word.clone(), w.start_ms, w.end_ms))
+            .collect::<Vec<_>>());
+    // RMVPE curve on the 16k vocal stem (or raw 16k mono)
+    let curve = if rmvpe::have_model(&args.models) {
+        stage("extracting melody (rmvpe)");
+        let audio16 = {
+            let voc = media.with_extension("vocals.wav");
+            if voc.exists() {
+                ff::read_wav_f32(&voc).map(|(s, _, _)| s).ok()
+            } else {
+                ff::decode_f32(media, 16000, 1).ok()
+            }
+        };
+        audio16.and_then(|a| {
+            rmvpe::extract_curve(&a, &args.models)
+                .map_err(|e| eprintln!("rmvpe failed: {e}")).ok()
+                .inspect(|c| {
+                    let voiced = c.f0.iter().zip(&c.conf)
+                        .filter(|(f, cf)| **f > 0.0 && **cf >= 0.3)
+                        .count();
+                    println!("rmvpe: {} frames, {} voiced",
+                             c.times.len(), voiced);
+                })
+        })
+    } else {
+        eprintln!("rmvpe.onnx not under {} — chart words get no pitch \
+                   (all freestyle)", args.models.display());
+        None
+    };
+    let (synced, plain): (Vec<(i64, String)>, Vec<String>) =
+        match rec {
+            Some(r) => (r.synced.clone(), r.plain.clone()),
+            None => (Vec::new(), Vec::new()),
+        };
+    let mut meta = genchart::GenMeta {
+        lyrics_kind: None,
+        lrc_shift_ms: None,
+        lrc_onset_only: false,
+        lines: 0, interp_lines: 0, asr_lines: 0,
+        words: 0, asr_words: 0, matched: 0, total: 0,
+    };
+    stage("generating chart");
+    match genchart::generate(artist, title, &synced, &plain, &asr,
+                             curve.as_ref(), &mut meta) {
+        Some(chart) => {
+            if let Err(e) = ups_core::chart::save_native(&chart, dest) {
+                eprintln!("chart write failed: {e}");
+                return;
+            }
+            let n: usize =
+                chart.tracks.values().map(|v| v.len()).sum();
+            println!("chart: generated {n} notes over {} lines \
+                      ({:?} lyrics, {} asr words{})",
+                     meta.lines, meta.lyrics_kind, meta.asr_words,
+                     meta.lrc_shift_ms
+                         .map(|s| format!(", lrc shift {s:.0}ms"))
+                         .unwrap_or_default());
+        }
+        None => eprintln!("chart: generation produced nothing usable \
+                           — try --chart with an imported file"),
+    }
 }

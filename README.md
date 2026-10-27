@@ -55,13 +55,14 @@ pitch detection math, manifest + folder library discovery, audit —
   inside `ups-app`; `ups-tv <root> <search>` plays one song standalone.
 
 - `ups-prep` — the prep station: YouTube URL or local file →
-  normalized media, vocal-cut `.inst.mp4`, vocal stem, aligned
-  `.upsong` chart, artwork, analysis sidecar — straight into a stick
-  folder the player scans.
+  normalized media, vocal-cut `.inst.mp4`, vocal stem, artwork,
+  analysis sidecar, and a `.upsong` chart — imported + chroma-aligned
+  when you supply one, or *generated from scratch* (ASR word timing +
+  RMVPE pitch) when you don't. Straight into a stick folder the player
+  scans.
 
-Not yet: chart *generation* (ASR + RMVPE pitch for songs with no
-imported chart — still Python-side), duet per-mic routing, autosync
-(station charts are GAP-corrected so plain GAP works).
+Not yet: duet per-mic routing, autosync (station charts are
+GAP-corrected so plain GAP works).
 
 ## Prepping songs (ups-prep)
 
@@ -81,19 +82,60 @@ Produces `Library/Artist - Title/<media>` + `.inst.mp4` + `.vocals.wav`
 pipeline writes, so folders are portable between prep stations.
 
 External tools (all cross-platform): `ffmpeg`, `ffprobe`, `yt-dlp`.
-Vocal separation additionally needs the sherpa-onnx source-separation
-binary and the spleeter int8 models:
+The ML stages use external sherpa-onnx binaries plus ONNX models —
+no Python or ML-framework installs:
 
 ```
-# from a sherpa-onnx release (win/linux/mac + arm builds exist):
-#   bin/sherpa-onnx-offline-source-separation -> <models>/bin/
+models/
+  bin/                                     sherpa-onnx binaries
+    sherpa-onnx-offline-source-separation  vocal separation
+    sherpa-onnx-offline                    ASR
+  sherpa-onnx-spleeter-2stems-int8/        separation models
+  sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/   ASR model
+  rmvpe.onnx                               melody extraction
+```
+
+```
+# sherpa-onnx binaries — grab the release for your OS
+#   (win-x64 / linux-x64+aarch64 / macos-x64+arm64 all exist):
+#   https://github.com/k2-fsa/sherpa-onnx/releases
+# copy sherpa-onnx-offline[-source-separation] + shared libs into
+# models/bin/
+
+# spleeter int8 separation models:
 curl -LO https://github.com/k2-fsa/sherpa-onnx/releases/download/\
 source-separation-models/sherpa-onnx-spleeter-2stems-int8.tar.bz2
-tar xjf sherpa-onnx-spleeter-2stems-int8.tar.bz2   # into <models>/
+tar xjf sherpa-onnx-spleeter-2stems-int8.tar.bz2   # into models/
+
+# parakeet ASR model (~490 MB, 25 languages):
+curl -LO https://github.com/k2-fsa/sherpa-onnx/releases/download/\
+asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8.tar.bz2
+tar xjf sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8.tar.bz2
+
+# rmvpe pitch model — same file the Python pipeline uses:
+#   ultrapistar/models/rmvpe.onnx  →  models/rmvpe.onnx
 ```
 
-Without the models the pipeline still runs — media, chart, artwork,
-analysis — just no `.inst.mp4` vocal cut.
+**ASR is Parakeet TDT, not Whisper** — a deliberate choice: TDT heads
+emit *native* per-token frame times (real word onsets), while sherpa's
+stock Whisper ONNX exports only give segment-level times. Parakeet
+runs ~4× faster than faster-whisper turbo on CPU and anchors lyrics
+frame-exactly. If the vocal stem won't transcribe (int8 spleeter
+artifacts), the raw media audio is tried automatically. The Python
+prep station uses faster-whisper `large-v3-turbo`; both are fine —
+charts are interchangeable either way.
+
+Chart generation (`genchart.rs`, a port of `genchart.py`): synced
+LRCLIB lyrics are placed by a global LRC→media shift that lands line
+onsets on heard-word onsets, then snapped to real phrase starts;
+unmatched lyrics interpolate between anchored neighbours; words the
+pitch curve can't confirm become `freestyle` notes instead of
+pitch-scored ones. Everything bakes to absolute media milliseconds
+(`BPM=15000`), so generated charts need no runtime warp.
+
+Without the models the pipeline still runs — media, artwork, analysis,
+imported-chart alignment — just no `.inst.mp4`, no vocal stem, and no
+generated chart.
 
 ## Platforms
 
