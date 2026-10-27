@@ -75,6 +75,11 @@ ups-prep <youtube-url | media-file> --library <stick root> [opts]
   --artist / --title   metadata overrides
   --guide F        guide-vocal level in the karaoke mix (default .15)
   --no-separate    skip the vocal cut
+
+ups-prep batch --library <root>   re-chart a whole library: walks
+  every song, regenerates .upsongs that were machine-generated
+  (or missing), and leaves imported/human charts untouched.
+  A stored parakeet transcript is reused so repeats are fast.
 ```
 
 Produces `Library/Artist - Title/<media>` + `.inst.mp4` + `.vocals.wav`
