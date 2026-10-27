@@ -42,11 +42,11 @@ impl ups_tv::Driver for App {
     /// (instrumental preference, audio-only flag).
     fn current(&self) -> Option<ups_tv::PlayItem> {
         let it = self.st.now_playing().or_else(|| self.st.start_next())?;
-        let e = self
-            .st
-            .entries
-            .iter()
-            .find(|e| e.id == it.entry_id)?;
+        let e = {
+            let entries = self.st.entries.read().unwrap();
+            entries.iter().find(|e| e.id == it.entry_id).cloned()
+        };
+        let e = e.as_ref()?;
         let want_cut = it
             .vocal_cut
             .map(|v| v != 0)
@@ -152,11 +152,10 @@ pub async fn push_now_playing(app: &App) {
 }
 
 fn now_playing_payload(app: &App, item: &QueueItem) -> Value {
-    let entry = app
-        .st
-        .entries
-        .iter()
-        .find(|e| e.id == item.entry_id);
+    let entry = {
+        let entries = app.st.entries.read().unwrap();
+        entries.iter().find(|e| e.id == item.entry_id).cloned()
+    };
     let Some(entry) = entry else {
         return json!({"item": app.st.item_row(item), "waiting": "missing"});
     };
@@ -193,7 +192,7 @@ fn now_playing_payload(app: &App, item: &QueueItem) -> Value {
     // native renderer owns the mic + session; browser-TV mode spawns
     // the sing session here instead
     let mic = if scoring && !app.native_tv {
-        begin_sing(app, item, entry)
+        begin_sing(app, item, &entry)
     } else {
         false
     };
@@ -303,7 +302,11 @@ async fn finish_item(app: &App, item_id: i64, outcome: &str) {
 }
 
 fn score_add_row(app: &App, h: &crate::state::HistoryRow) -> Value {
-    let e = app.st.entries.iter().find(|e| e.song_id == h.song_id);
+    let e = {
+        let entries = app.st.entries.read().unwrap();
+        entries.iter().find(|e| e.song_id == h.song_id)
+            .map(|e| (e.artist.clone(), e.title.clone()))
+    };
     let p1 = app.st.performer(h.performer_id);
     let p2 = h.performer2_id.and_then(|id| app.st.performer(id));
     let name = match (p1, p2) {
@@ -315,8 +318,8 @@ fn score_add_row(app: &App, h: &crate::state::HistoryRow) -> Value {
         "id": h.queue_item_id.unwrap_or(0),
         "performer": name,
         "song_id": h.song_id,
-        "artist": e.map(|e| e.artist.clone()).unwrap_or_default(),
-        "title": e.map(|e| e.title.clone()).unwrap_or_default(),
+        "artist": e.as_ref().map(|f| f.0.clone()).unwrap_or_default(),
+        "title": e.as_ref().map(|f| f.1.clone()).unwrap_or_default(),
         "score": h.score,
         "played_at": h.played_at,
     })

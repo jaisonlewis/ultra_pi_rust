@@ -231,13 +231,16 @@ fn qr_svg(data: &str) -> String {
 async fn media_file(AxState(app): AxState<Arc<App>>, Path(id): Path<i64>,
                     Query(q): Query<BTreeMap<String, String>>, req: Request)
     -> Response {
-    let Some(entry) = app.st.entries.iter().find(|e| e.id == id) else {
-        return (StatusCode::NOT_FOUND, "no entry").into_response();
-    };
-    let path: PathBuf = if q.get("v").map(|v| v.as_str()) == Some("inst") {
-        entry.inst.clone().unwrap_or_else(|| entry.media.clone())
-    } else {
-        entry.media.clone()
+    let path: PathBuf = {
+        let entries = app.st.entries.read().unwrap();
+        let Some(entry) = entries.iter().find(|e| e.id == id) else {
+            return (StatusCode::NOT_FOUND, "no entry").into_response();
+        };
+        if q.get("v").map(|v| v.as_str()) == Some("inst") {
+            entry.inst.clone().unwrap_or_else(|| entry.media.clone())
+        } else {
+            entry.media.clone()
+        }
     };
     match ServeFile::new(&path).oneshot(req).await {
         Ok(r) => r.into_response(),
@@ -253,13 +256,17 @@ async fn art_file(AxState(app): AxState<Arc<App>>, Path(fname): Path<String>,
     let Ok(id) = stem.parse::<i64>() else {
         return (StatusCode::NOT_FOUND, "bad art id").into_response();
     };
-    let Some(entry) = app.st.entries.iter().find(|e| e.id == id) else {
+    let path = {
+        let entries = app.st.entries.read().unwrap();
+        entries
+            .iter()
+            .find(|e| e.id == id)
+            .and_then(|e| e.art.clone())
+    };
+    let Some(path) = path else {
         return (StatusCode::NOT_FOUND, "no art").into_response();
     };
-    let Some(path) = &entry.art else {
-        return (StatusCode::NOT_FOUND, "no art").into_response();
-    };
-    match ServeFile::new(path).oneshot(req).await {
+    match ServeFile::new(&path).oneshot(req).await {
         Ok(r) => r.into_response(),
         Err(e) => (StatusCode::NOT_FOUND, format!("{e}")).into_response(),
     }
@@ -405,6 +412,8 @@ async fn api_search(AxState(app): AxState<Arc<App>>,
     let results: Vec<Value> = app
         .st
         .entries
+        .read()
+        .unwrap()
         .iter()
         .filter(|e| {
             query.is_empty()
@@ -419,7 +428,7 @@ async fn api_search(AxState(app): AxState<Arc<App>>,
 async fn api_library(AxState(app): AxState<Arc<App>>) -> impl IntoResponse {
     let tops = app.st.top_scores();
     Json(json!({
-        "results": app.st.entries.iter()
+        "results": app.st.entries.read().unwrap().iter()
             .map(|e| e.row(tops.get(&e.song_id))).collect::<Vec<_>>()
     }))
 }
@@ -440,7 +449,11 @@ async fn api_scores(AxState(app): AxState<Arc<App>>) -> impl IntoResponse {
     let tops: Vec<Value> = best
         .values()
         .map(|h| {
-            let e = app.st.entries.iter().find(|e| e.song_id == h.song_id);
+            let e = {
+                let entries = app.st.entries.read().unwrap();
+                entries.iter().find(|e| e.song_id == h.song_id)
+                    .map(|e| (e.artist.clone(), e.title.clone()))
+            };
             let p1 = app.st.performer(h.performer_id);
             let p2 = h.performer2_id.and_then(|id| app.st.performer(id));
             let name = match (p1, p2) {
@@ -450,8 +463,8 @@ async fn api_scores(AxState(app): AxState<Arc<App>>) -> impl IntoResponse {
             };
             json!({
                 "song_id": h.song_id,
-                "artist": e.map(|e| e.artist.clone()).unwrap_or_default(),
-                "title": e.map(|e| e.title.clone()).unwrap_or_default(),
+                "artist": e.as_ref().map(|f| f.0.clone()).unwrap_or_default(),
+                "title": e.as_ref().map(|f| f.1.clone()).unwrap_or_default(),
                 "score": h.score,
                 "scorer": name,
                 "played_at": h.played_at,
@@ -518,16 +531,21 @@ async fn api_queue_add(AxState(app): AxState<Arc<App>>, headers: HeaderMap,
             .into_response();
     };
     let entry_id = body.entry_id.or(body.song_id).unwrap_or(-1);
-    let Some(entry) = app.st.entries.iter().find(|e| {
-        e.id == entry_id || e.song_id == entry_id
-    }) else {
+    let entry = {
+        let entries = app.st.entries.read().unwrap();
+        entries
+            .iter()
+            .find(|e| e.id == entry_id || e.song_id == entry_id)
+            .map(|e| (e.id, e.is_duet))
+    };
+    let Some((entry_id, is_duet)) = entry else {
         return (
             StatusCode::NOT_FOUND,
             Json(json!({"error": "unknown catalog entry"})),
         )
             .into_response();
     };
-    let perf2_id = if entry.is_duet {
+    let perf2_id = if is_duet {
         body.name2
             .as_ref()
             .map(|n| n.trim().to_string())
@@ -546,7 +564,7 @@ async fn api_queue_add(AxState(app): AxState<Arc<App>>, headers: HeaderMap,
         })
     };
     let id = app.st.queue_add(
-        entry.id,
+        entry_id,
         perf_id,
         perf2_id,
         body.part.clone().unwrap_or_default().trim().to_string(),
@@ -615,8 +633,15 @@ async fn api_queue_join_duet(AxState(app): AxState<Arc<App>>,
             return (StatusCode::NOT_FOUND, Json(json!({"error": "not found"})))
                 .into_response();
         };
-        let entry = app.st.entries.iter().find(|e| e.id == it.entry_id);
-        let open = entry.map(|e| e.is_duet).unwrap_or(false)
+        let open = app
+            .st
+            .entries
+            .read()
+            .unwrap()
+            .iter()
+            .find(|e| e.id == it.entry_id)
+            .map(|e| e.is_duet)
+            .unwrap_or(false)
             && it.performer2_id.is_none();
         if !open {
             return (
@@ -706,6 +731,46 @@ async fn api_queue_clear(AxState(app): AxState<Arc<App>>, headers: HeaderMap)
     app.st.persist();
     let _ = app.io.emit("state", &app.st.snapshot()).await;
     Json(json!({"ok": true, "cleared": n})).into_response()
+}
+
+/// POST /api/catalog/rescan — hot rescan of the media root: new song
+/// folders appear live, dropped folders disappear, sidecars that
+/// arrived mid-session upgrade their entry. Host-only like Python;
+/// `charts_added` maps to entries that gained a chart (the host page
+/// toasts that count).
+async fn api_catalog_rescan(AxState(app): AxState<Arc<App>>,
+                            headers: HeaderMap) -> Response {
+    let (sid, _) = ensure_sid(&app, &headers);
+    if !is_host(&app, &headers, &sid) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "host key required"})),
+        )
+            .into_response();
+    }
+    let a = app.clone();
+    let r = match tokio::task::spawn_blocking(move || a.st.rescan()).await {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("rescan failed: {e}")})),
+            )
+                .into_response();
+        }
+    };
+    if r.added + r.removed + r.updated > 0 {
+        let _ = app.io.emit("state", &app.st.snapshot()).await;
+    }
+    Json(json!({
+        "ok": true,
+        "added": r.added,
+        "removed": r.removed,
+        "updated": r.updated,
+        "charts_added": r.upgraded,
+        "songs": r.total,
+    }))
+    .into_response()
 }
 
 // -- playback ----------------------------------------------------------------
@@ -933,6 +998,7 @@ pub fn router(app: Arc<App>, sio_layer: socketioxide::layer::SocketIoLayer) -> R
         .route("/api/search", get(api_search))
         .route("/api/library", get(api_library))
         .route("/api/scores", get(api_scores))
+        .route("/api/catalog/rescan", post(api_catalog_rescan))
         // queue
         .route("/api/queue", get(api_queue_list).post(api_queue_add))
         .route("/api/queue/{id}/remove", post(api_queue_remove))

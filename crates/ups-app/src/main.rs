@@ -119,7 +119,7 @@ fn main() {
     );
     eprintln!(
         "ups-app: {} songs under {}",
-        st.entries.len(),
+        st.entries.read().unwrap().len(),
         root.display()
     );
     eprintln!("ups-app: host key {}", st.host_key);
@@ -157,6 +157,41 @@ fn main() {
                 });
             }
             sock::register(&io, app.clone());
+            // hot rescan — drop a folder on the stick and it shows up
+            // without a restart. UPS_RESCAN_SEC=0 disables.
+            let rescan_sec = std::env::var("UPS_RESCAN_SEC")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(15);
+            if rescan_sec > 0 {
+                let a = app.clone();
+                tokio::spawn(async move {
+                    let mut iv = tokio::time::interval(
+                        std::time::Duration::from_secs(rescan_sec),
+                    );
+                    iv.tick().await; // first tick is immediate — skip it
+                    loop {
+                        iv.tick().await;
+                        let aa = a.clone();
+                        let r = tokio::task::spawn_blocking(move || {
+                            aa.st.rescan()
+                        })
+                        .await;
+                        if let Ok(r) = r {
+                            if r.added + r.removed + r.updated > 0 {
+                                eprintln!(
+                                    "rescan: +{} -{} ~{} songs ({} total)",
+                                    r.added, r.removed, r.updated, r.total
+                                );
+                                let _ = a
+                                    .io
+                                    .emit("state", &a.st.snapshot())
+                                    .await;
+                            }
+                        }
+                    }
+                });
+            }
             let router = web::router(app.clone(), layer);
             let addr: SocketAddr = format!("{bind}:{port}").parse().unwrap();
             let listener = tokio::net::TcpListener::bind(addr)

@@ -2,9 +2,9 @@
 //! browser sessions. Replaces the Python app's SQLite layer for the
 //! party loop; persists to `ups-state.json` for restart recovery.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -20,6 +20,7 @@ pub fn now_secs() -> f64 {
 
 /// One playable catalog row (a manifest song): entry_id is 1-based
 /// manifest order — stable across scans of an unchanged manifest.
+#[derive(Clone)]
 pub struct Entry {
     pub id: i64,
     pub song_id: i64,
@@ -70,6 +71,64 @@ impl Entry {
             "top_scorer": top.map(|t| t.scorer.clone()),
         })
     }
+}
+
+/// catalog::Song → Entry — loads the chart for duet/alt flags and
+/// tags audio-only media. Shared by the boot scan and hot rescan.
+fn entry_of(s: &catalog::Song, id: i64) -> Entry {
+    let (is_duet, tracks, chart_alt) = s
+        .chart
+        .as_ref()
+        .map(|p| {
+            let c = ups_core::chart::load_chart(p);
+            (
+                c.is_duet(),
+                c.tracks.keys().cloned().collect::<Vec<_>>(),
+                c.tracks
+                    .values()
+                    .flatten()
+                    .any(|n| !n.alt.is_empty()),
+            )
+        })
+        .unwrap_or((false, vec!["P1".to_string()], false));
+    let name = s
+        .media
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_lowercase();
+    let audio_only = ["mp3", "m4a", "ogg", "wav", "flac"]
+        .iter()
+        .any(|e| name.ends_with(e));
+    Entry {
+        id,
+        song_id: id,
+        artist: s.artist.clone(),
+        title: s.title.clone(),
+        language: String::new(),
+        provider: s.provider.clone(),
+        source_id: s.source_id.clone(),
+        duration_sec: s.duration_sec,
+        media: s.media.clone(),
+        inst: s.inst.clone(),
+        chart: s.chart.clone(),
+        art: s.art.clone(),
+        is_duet,
+        tracks,
+        chart_alt,
+        audio_only,
+    }
+}
+
+/// What a rescan changed — drives the host toast + state broadcast.
+#[derive(Default)]
+pub struct Rescan {
+    pub added: usize,
+    pub removed: usize,
+    pub updated: usize,
+    /// entries that gained a chart or karaoke track this scan
+    pub upgraded: usize,
+    pub total: usize,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -132,7 +191,7 @@ pub struct State {
     pub difficulty: i64,
     pub vocal_cut_default: bool,
     pub intermission_sec: f64,
-    pub entries: Vec<Entry>,
+    pub entries: RwLock<Vec<Entry>>,
     pub performers: Mutex<Vec<Performer>>,
     pub queue: Mutex<Vec<QueueItem>>,
     pub history: Mutex<Vec<HistoryRow>>,
@@ -155,55 +214,13 @@ impl State {
     pub fn new(root: PathBuf, host_key: String, build_v: String,
                difficulty: i64, vocal_cut: bool, intermission_sec: f64,
                state_path: PathBuf) -> Self {
-        let entries = catalog::scan(&root)
-            .into_iter()
-            .enumerate()
-            .map(|(i, s)| {
-                let id = (i + 1) as i64;
-                let (is_duet, tracks, chart_alt) = s
-                    .chart
-                    .as_ref()
-                    .map(|p| {
-                        let c = ups_core::chart::load_chart(p);
-                        (
-                            c.is_duet(),
-                            c.tracks.keys().cloned().collect::<Vec<_>>(),
-                            c.tracks
-                                .values()
-                                .flatten()
-                                .any(|n| !n.alt.is_empty()),
-                        )
-                    })
-                    .unwrap_or((false, vec!["P1".to_string()], false));
-                let name = s
-                    .media
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_lowercase();
-                let audio_only = ["mp3", "m4a", "ogg", "wav", "flac"]
-                    .iter()
-                    .any(|e| name.ends_with(e));
-                Entry {
-                    id,
-                    song_id: id,
-                    artist: s.artist,
-                    title: s.title,
-                    language: String::new(),
-                    provider: s.provider,
-                    source_id: s.source_id,
-                    duration_sec: s.duration_sec,
-                    media: s.media,
-                    inst: s.inst,
-                    chart: s.chart,
-                    art: s.art,
-                    is_duet,
-                    tracks,
-                    chart_alt,
-                    audio_only,
-                }
-            })
-            .collect();
+        let entries = RwLock::new(
+            catalog::scan(&root)
+                .iter()
+                .enumerate()
+                .map(|(i, s)| entry_of(s, (i + 1) as i64))
+                .collect::<Vec<_>>(),
+        );
         let mut st = State {
             root,
             host_key,
@@ -266,6 +283,54 @@ impl State {
         }
     }
 
+    /// Re-walk the media root and merge changes in place — new song
+    /// folders appear, removed ones drop, and songs that gained an
+    /// inst/chart/art sidecar upgrade without losing their entry id
+    /// (so the queue keeps pointing at the right song).
+    pub fn rescan(&self) -> Rescan {
+        let songs = catalog::scan(&self.root);
+        let mut entries = self.entries.write().unwrap();
+        let mut r = Rescan {
+            total: songs.len(),
+            ..Default::default()
+        };
+        let mut next_id =
+            entries.iter().map(|e| e.id).max().unwrap_or(0) + 1;
+        let mut keep: HashSet<PathBuf> = HashSet::with_capacity(songs.len());
+        for s in &songs {
+            keep.insert(s.media.clone());
+            match entries.iter_mut().find(|e| e.media == s.media) {
+                Some(e) => {
+                    let fresh = entry_of(s, e.id);
+                    if e.chart.is_none() && fresh.chart.is_some()
+                        || e.inst.is_none() && fresh.inst.is_some()
+                    {
+                        r.upgraded += 1;
+                    }
+                    let same = e.artist == fresh.artist
+                        && e.title == fresh.title
+                        && e.duration_sec == fresh.duration_sec
+                        && e.inst == fresh.inst
+                        && e.chart == fresh.chart
+                        && e.art == fresh.art;
+                    if !same {
+                        *e = fresh;
+                        r.updated += 1;
+                    }
+                }
+                None => {
+                    entries.push(entry_of(s, next_id));
+                    next_id += 1;
+                    r.added += 1;
+                }
+            }
+        }
+        let before = entries.len();
+        entries.retain(|e| keep.contains(&e.media));
+        r.removed = before - entries.len();
+        r
+    }
+
     // -- performers ---------------------------------------------------------
     pub fn add_performer(&self, name: &str) -> Performer {
         let mut perfs = self.performers.lock().unwrap();
@@ -296,7 +361,8 @@ impl State {
                      performer2_id: Option<i64>, part_choice: String,
                      vocal_cut: Option<i64>,
                      lyrics_rom: Option<i64>) -> i64 {
-        let entry = self.entries.iter().find(|e| e.id == entry_id);
+        let entry = self.entries.read().unwrap()
+            .iter().find(|e| e.id == entry_id).map(|e| e.song_id);
         let mut q = self.queue.lock().unwrap();
         let mut n = self.next_queue_item.lock().unwrap();
         let top = q
@@ -310,7 +376,7 @@ impl State {
             position: top + 1.0,
             part_choice,
             created_at: now_secs(),
-            song_id: entry.map(|e| e.song_id).unwrap_or(entry_id),
+            song_id: entry.unwrap_or(entry_id),
             entry_id,
             performer_id,
             performer2_id,
@@ -396,7 +462,13 @@ impl State {
 
     /// Queue item joined with entry + performer fields — the ITEM_SQL row.
     pub fn item_row(&self, it: &QueueItem) -> Value {
-        let e = self.entries.iter().find(|e| e.id == it.entry_id);
+        let e = {
+            let entries = self.entries.read().unwrap();
+            entries.iter().find(|e| e.id == it.entry_id).map(|e| (
+                e.artist.clone(), e.title.clone(), e.is_duet,
+                e.provider.clone(),
+            ))
+        };
         let p1 = self.performer(it.performer_id);
         let p2 = it.performer2_id.and_then(|id| self.performer(id));
         json!({
@@ -410,10 +482,10 @@ impl State {
             "performer2_id": it.performer2_id,
             "vocal_cut": it.vocal_cut,
             "lyrics_rom": it.lyrics_rom,
-            "artist": e.map(|e| e.artist.clone()).unwrap_or_default(),
-            "title": e.map(|e| e.title.clone()).unwrap_or_default(),
-            "is_duet": e.map(|e| e.is_duet).unwrap_or(false),
-            "provider": e.map(|e| e.provider.clone()).unwrap_or_default(),
+            "artist": e.as_ref().map(|f| f.0.clone()).unwrap_or_default(),
+            "title": e.as_ref().map(|f| f.1.clone()).unwrap_or_default(),
+            "is_duet": e.as_ref().map(|f| f.2).unwrap_or(false),
+            "provider": e.as_ref().map(|f| f.3.clone()).unwrap_or_default(),
             "entry_id": it.entry_id,
             "entry_status": "available",
             "singer": p1.as_ref().map(|p| p.name.clone()),
