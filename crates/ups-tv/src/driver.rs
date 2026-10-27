@@ -514,8 +514,10 @@ fn play_item(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
     let mut target_score: f64 = 0.0;
     let mut cur_streak: i64 = 0;
     let song_start = Instant::now();
-    let lane_y = (fh as f64 * 0.58) as i32;
-    let lane_h = (fh as f64 * 0.16) as i32;
+    // pitch lane at the top like the browser TV (top 8vh, 26vh tall)
+    // — the HUD strip sits in the ~8% above it, lyrics anchor bottom
+    let lane_y = (fh as f64 * 0.10) as i32;
+    let lane_h = (fh as f64 * 0.24) as i32;
 
     // intermission countdown — sink is paused, so nothing is audible
     // until it ends (media starts decoding only after, too)
@@ -940,14 +942,14 @@ fn play_item(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
                 tb.draw(fb, fw, fh, p, (fw as i32 - w) / 2,
                         fh as i32 / 2, paused_px, render::GOLDEN);
             }
-            // rating pops rise and die over ~1.6s — perfect/big lines
-            // take the center in gold
+            // rating pops rise and die over ~1.6s — web puts them just
+            // under the lane (top 38vh); perfect/big lines go gold
             for pop in &fx.pops {
                 let age = now_f32 - pop.born;
                 let px = if pop.big { pop_big_px } else { pop_px };
                 let w = tb.width(&pop.text, px) as i32;
-                let py = lane_y - (20.0 * s) as i32
-                    - (age * 44.0 * s) as i32;
+                let py = lane_y + lane_h + (56.0 * s) as i32
+                    - (age * 34.0 * s) as i32;
                 let col = if pop.golden { render::GOLDEN }
                           else { render::TEXT };
                 tb.draw_outline(fb, fw, fh, &pop.text,
