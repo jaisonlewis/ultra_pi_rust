@@ -47,6 +47,9 @@ pub struct Entry {
     pub tracks: Vec<String>,
     pub chart_alt: bool,
     pub audio_only: bool,
+    /// chart file mtime at last parse — lets rescan skip load_chart
+    /// for the (overwhelmingly common) unchanged-chart case
+    chart_mtime: Option<u64>,
 }
 
 impl Entry {
@@ -80,6 +83,14 @@ impl Entry {
             "top_scorer": top.map(|t| t.scorer.clone()),
         })
     }
+}
+
+fn chart_mtime(p: &Option<PathBuf>) -> Option<u64> {
+    p.as_ref()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
 }
 
 /// catalog::Song → Entry — loads the chart for duet/alt flags and
@@ -125,6 +136,7 @@ fn entry_of(s: &catalog::Song, id: i64) -> Entry {
         is_duet,
         tracks,
         chart_alt,
+        chart_mtime: chart_mtime(&s.chart),
         audio_only,
     }
 }
@@ -334,6 +346,30 @@ impl State {
             keep.insert(s.media.clone());
             match entries.iter_mut().find(|e| e.media == s.media) {
                 Some(e) => {
+                    // cheap path: same chart file, unchanged mtime — keep
+                    // the parsed flags and only refresh path-level fields.
+                    // 400 chart parses per 15s tick starved the Pi's audio.
+                    if e.chart == s.chart && e.chart_mtime == chart_mtime(&s.chart)
+                    {
+                        let same = e.artist == s.artist
+                            && e.title == s.title
+                            && e.duration_sec == s.duration_sec
+                            && e.inst == s.inst
+                            && e.art == s.art
+                            && e.provider == s.provider
+                            && e.source_id == s.source_id;
+                        if !same {
+                            e.artist = s.artist.clone();
+                            e.title = s.title.clone();
+                            e.duration_sec = s.duration_sec;
+                            e.inst = s.inst.clone();
+                            e.art = s.art.clone();
+                            e.provider = s.provider.clone();
+                            e.source_id = s.source_id.clone();
+                            r.updated += 1;
+                        }
+                        continue;
+                    }
                     let fresh = entry_of(s, e.id);
                     if e.chart.is_none() && fresh.chart.is_some()
                         || e.inst.is_none() && fresh.inst.is_some()
