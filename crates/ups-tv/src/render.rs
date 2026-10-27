@@ -134,6 +134,23 @@ pub fn blit_video(fb: &mut [u32], rgb: &[u8], fw: usize, fh: usize) {
     }
 }
 
+/// alpha-blended rectangle with rounded corners — per-row inset from
+/// the quarter-circle at each end (the lyric band's card)
+pub fn rrect(fb: &mut [u32], fw: usize, fh: usize,
+             x: i32, y: i32, w: i32, h: i32, rad: i32, rgb: u32, a: u32) {
+    let r = rad.max(0).min(w / 2).min(h / 2);
+    for yy in y..(y + h) {
+        let edge = (yy - y).min((y + h - 1) - yy);
+        let inset = if edge < r {
+            let d = (r - edge) as f64;
+            r - ((r * r) as f64 - d * d).max(0.0).sqrt() as i32
+        } else {
+            0
+        };
+        rect(fb, fw, fh, x + inset, yy, w - 2 * inset, 1, rgb, a);
+    }
+}
+
 /// alpha-blended rectangle (a = 0..255)
 pub fn rect(fb: &mut [u32], fw: usize, fh: usize,
             x: i32, y: i32, w: i32, h: i32, rgb: u32, a: u32) {

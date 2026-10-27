@@ -138,6 +138,9 @@ fn present(window: &mut Window, fb: &[u32], w: usize, h: usize) -> bool {
     }
 }
 
+/// karaoke wipe fill — the web TV's trackColors.P1
+const TRACK_P1: u32 = 0xff5a5a;
+
 /// rating tiers on the scorer's 0..8 scale — same ladder as the web
 /// TV ("PERFECT LINE" reserved for the top rung)
 const RATING_LABELS: [&str; 9] = [
@@ -484,6 +487,8 @@ fn play_item(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
     driver.emit("mic:state", &json!({"ok": mic.is_some()}));
 
     let mut frame = vec![0u32; fw * fh];
+    // bold face for the lyric line/score — web TV renders them at 700
+    let mut text_b = Text::new_bold();
     let mut hit_flash_until = Instant::now();
     let mut last_tick = 0u64;
     let mut fx = Fx::new();
@@ -807,68 +812,105 @@ fn play_item(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
             let next = phrases
                 .iter()
                 .find(|p| gap_ms + p.start as f64 * beat_ms > pos_ms);
+            // the lyric card — same .lyric-band look as the browser TV:
+            // a translucent dark rounded panel behind both lines so the
+            // text reads over any video
+            if cur.is_some() || next.is_some() {
+                let pad_v = (lyric_px as f64 * 0.42) as i32;
+                let y1 = lh_y + (62.0 * s) as i32 + next_px as i32
+                    + (lyric_px as f64 * 0.30) as i32;
+                render::rrect(
+                    fb, fw, fh,
+                    (fw as f64 * 0.05) as i32, lh_y - pad_v,
+                    (fw as f64 * 0.90) as i32, y1 - lh_y + pad_v,
+                    (14.0 * s) as i32, 0x070b16, 208,
+                );
+            }
+            let tb = text_b.as_mut().unwrap_or(t);
             if let Some(p) = cur {
                 let mut cx =
-                    (fw as i32 - t.width(&p.text, lyric_px) as i32) / 2;
+                    (fw as i32 - tb.width(&p.text, lyric_px) as i32) / 2;
+                let o = ((lyric_px as f64) / 26.0).ceil().max(1.0) as i32;
                 for syl in &p.syls {
-                    let sung_on =
-                        gap_ms + syl.s as f64 * beat_ms <= pos_ms;
-                    cx += t.draw(
-                        fb, fw, fh, &syl.t, cx, lh_y, lyric_px,
-                        if sung_on { render::SUNG } else { render::TEXT },
-                    ) as i32;
+                    let s_ms = gap_ms + syl.s as f64 * beat_ms;
+                    let e_ms = gap_ms + syl.e as f64 * beat_ms;
+                    let f = ((pos_ms - s_ms)
+                        / (e_ms - s_ms).max(1.0))
+                    .clamp(0.0, 1.0);
+                    let sw = tb.width(&syl.t, lyric_px) as i32;
+                    tb.draw_outline(fb, fw, fh, &syl.t, cx, lh_y,
+                                    lyric_px, 0x05070d, o);
+                    tb.draw_clip(fb, fw, fh, &syl.t, cx, lh_y,
+                                 lyric_px, 0xd1d1d1, i32::MAX);
+                    if f > 0.0 {
+                        let wipe = cx + (f * sw as f64) as i32;
+                        tb.draw_clip(fb, fw, fh, &syl.t, cx, lh_y,
+                                     lyric_px, TRACK_P1, wipe);
+                    }
+                    cx += sw;
                     if syl.wb {
-                        cx += t.draw(fb, fw, fh, " ", cx, lh_y,
-                                     lyric_px, render::TEXT)
-                            as i32;
+                        cx += tb.width(" ", lyric_px) as i32;
                     }
                 }
             }
             if let Some(p) = next {
-                let w = t.width(&p.text, next_px) as i32;
-                t.draw(fb, fw, fh, &p.text, (fw as i32 - w) / 2,
-                       lh_y + (62.0 * s) as i32, next_px,
-                       render::TEXT_DIM);
+                let w = tb.width(&p.text, next_px) as i32;
+                let nx = (fw as i32 - w) / 2;
+                let ny = lh_y + (62.0 * s) as i32;
+                let o = ((next_px as f64) / 26.0).ceil().max(1.0) as i32;
+                tb.draw_outline(fb, fw, fh, &p.text, nx, ny, next_px,
+                                0x05070d, o);
+                tb.draw(fb, fw, fh, &p.text, nx, ny, next_px,
+                        render::TEXT_DIM);
             }
             // eased score digits — the display value chases the real
             // total instead of snapping (exponential approach, ~150ms)
             fx.disp_score += (target_score - fx.disp_score)
                 * (1.0 - (-6.0 * dt as f64).exp());
-            t.draw(fb, fw, fh,
-                   &format!("{} — {}", it.artist, it.title),
-                   (16.0 * s) as i32, (14.0 * s) as i32, hud_px,
-                   render::TEXT_DIM);
-            t.draw(fb, fw, fh,
-                   &format!("{}", fx.disp_score.round() as i64),
-                   fw as i32 - (160.0 * s) as i32, (12.0 * s) as i32,
-                   score_px, render::TEXT);
+            tb.draw(fb, fw, fh,
+                    &format!("{} — {}", it.artist, it.title),
+                    (16.0 * s) as i32, (14.0 * s) as i32, hud_px,
+                    render::TEXT_DIM);
+            {
+                let sc_txt = format!("{}", fx.disp_score.round() as i64);
+                let sx = fw as i32 - (160.0 * s) as i32;
+                let sy = (12.0 * s) as i32;
+                let o = ((score_px as f64) / 26.0).ceil().max(1.0) as i32;
+                tb.draw_outline(fb, fw, fh, &sc_txt, sx, sy, score_px,
+                                0x05070d, o);
+                tb.draw(fb, fw, fh, &sc_txt, sx, sy, score_px,
+                        render::TEXT);
+            }
             if cur_streak >= 2 {
-                t.draw(fb, fw, fh, &format!("x{cur_streak}"),
-                       fw as i32 - (120.0 * s) as i32,
-                       (58.0 * s) as i32, hud_px, render::STREAK);
+                tb.draw(fb, fw, fh, &format!("x{cur_streak}"),
+                        fw as i32 - (120.0 * s) as i32,
+                        (58.0 * s) as i32, hud_px, render::STREAK);
             }
             if !it.singer.is_empty() {
-                t.draw(fb, fw, fh, &it.singer, (16.0 * s) as i32,
-                       (38.0 * s) as i32, singer_px, render::TEXT_DIM);
+                tb.draw(fb, fw, fh, &it.singer, (16.0 * s) as i32,
+                        (38.0 * s) as i32, singer_px, render::TEXT_DIM);
             }
             if driver.paused() {
                 let p = "PAUSED";
-                let w = t.width(p, paused_px) as i32;
-                t.draw(fb, fw, fh, p, (fw as i32 - w) / 2,
-                       fh as i32 / 2, paused_px, render::GOLDEN);
+                let w = tb.width(p, paused_px) as i32;
+                tb.draw(fb, fw, fh, p, (fw as i32 - w) / 2,
+                        fh as i32 / 2, paused_px, render::GOLDEN);
             }
             // rating pops rise and die over ~1.6s — perfect/big lines
             // take the center in gold
             for pop in &fx.pops {
                 let age = now_f32 - pop.born;
                 let px = if pop.big { pop_big_px } else { pop_px };
-                let w = t.width(&pop.text, px) as i32;
+                let w = tb.width(&pop.text, px) as i32;
                 let py = lane_y - (20.0 * s) as i32
                     - (age * 44.0 * s) as i32;
                 let col = if pop.golden { render::GOLDEN }
                           else { render::TEXT };
-                t.draw(fb, fw, fh, &pop.text, (fw as i32 - w) / 2,
-                       py, px, col);
+                tb.draw_outline(fb, fw, fh, &pop.text,
+                                (fw as i32 - w) / 2, py, px,
+                                0x05070d, 1);
+                tb.draw(fb, fw, fh, &pop.text, (fw as i32 - w) / 2,
+                        py, px, col);
             }
         }
         render::draw_particles(fb, fw, fh, &fx.parts, now_f32);
