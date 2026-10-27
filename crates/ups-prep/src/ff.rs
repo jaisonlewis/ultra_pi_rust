@@ -237,11 +237,11 @@ fn encoder_list() -> &'static str {
 fn hevc_args() -> Vec<Vec<String>> {
     let enc = encoder_list();
     [
-        ("hevc_nvenc", vec!["-preset", "p5", "-b:v", "6M"]),
-        ("hevc_qsv", vec!["-b:v", "6M"]),
-        ("hevc_amf", vec!["-b:v", "6M"]),
-        ("hevc_mf", vec!["-b:v", "6M"]),
-        ("libx265", vec!["-preset", "fast", "-crf", "24"]),
+        ("hevc_nvenc", vec!["-preset", "p5", "-b:v", "2M"]),
+        ("hevc_qsv", vec!["-b:v", "2M"]),
+        ("hevc_amf", vec!["-b:v", "2M"]),
+        ("hevc_mf", vec!["-b:v", "2M"]),
+        ("libx265", vec!["-preset", "fast", "-crf", "26"]),
     ]
     .iter()
     .filter(|(name, _)| enc.contains(name))

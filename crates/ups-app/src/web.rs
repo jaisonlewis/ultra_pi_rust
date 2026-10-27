@@ -42,9 +42,13 @@ fn sid_of(headers: &HeaderMap) -> Option<String> {
 
 fn ensure_sid(app: &App, headers: &HeaderMap) -> (String, bool) {
     if let Some(sid) = sid_of(headers) {
-        if app.st.sessions.lock().unwrap().contains_key(&sid) {
-            return (sid, false);
-        }
+        // adopt the client's sid — minting a new one here would orphan
+        // every API caller after a restart (the Set-Cookie only ever
+        // goes out on page loads), leaving joins that can't queue.
+        app.st.sessions.lock().unwrap()
+            .entry(sid.clone())
+            .or_insert_with(crate::state::SessionCookie::default);
+        return (sid, false);
     }
     let sid = format!("{:x}{:x}", crate::state::now_secs() as u64,
                       app.st.sessions.lock().unwrap().len());
