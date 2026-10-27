@@ -489,16 +489,27 @@ pub fn scan_folders(root: &Path) -> Vec<Song> {
     out
 }
 
-/// Manifest records if present, else the folder scan — the same order
-/// the Pi/Switch resolve a library.
+/// Manifest records plus any folders the manifest doesn't know about —
+/// a stick built by folder copy has no manifest at all, and folders
+/// dropped onto a manifest-managed root still count (the manifest may
+/// lag the filesystem). Deduped by resolved media path so a folder
+/// whose media a manifest record already claims isn't listed twice.
 pub fn scan(root: &Path) -> Vec<Song> {
     let recs = read_manifest(root);
-    if !recs.is_empty() {
-        let songs: Vec<Song> =
-            recs.iter().filter_map(|r| resolve_rec(root, r)).collect();
-        if !songs.is_empty() {
-            return songs;
-        }
+    if recs.is_empty() {
+        return scan_folders(root);
     }
-    scan_folders(root)
+    let mut songs: Vec<Song> =
+        recs.iter().filter_map(|r| resolve_rec(root, r)).collect();
+    if songs.is_empty() {
+        return scan_folders(root);
+    }
+    let seen: std::collections::HashSet<PathBuf> =
+        songs.iter().map(|s| s.media.clone()).collect();
+    songs.extend(
+        scan_folders(root)
+            .into_iter()
+            .filter(|s| !seen.contains(&s.media)),
+    );
+    songs
 }
