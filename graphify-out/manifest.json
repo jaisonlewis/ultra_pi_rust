@@ -1,0 +1,286 @@
+{
+  "I:\\AI\\ultra-pi-star-rust\\crates\\ups-app\\src\\audio.rs": {
+    "mtime": 1793128661.125316,
+    "hash": "7b0f47c528b2acbf4eb89c590c86d146"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\crates\\ups-app\\src\\main.rs": {
+    "mtime": 1793132773.3468416,
+    "hash": "75a4b694127696b2c0900303ace37864"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\crates\\ups-app\\src\\mic.rs": {
+    "mtime": 1793046426.2949872,
+    "hash": "a7c95e705a320f24a6f33e611c003570"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\crates\\ups-app\\src\\monitor.rs": {
+    "mtime": 1793052430.1827803,
+    "hash": "607113c71915151f8b5c04d1680b7ee5"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\crates\\ups-app\\src\\sock.rs": {
+    "mtime": 1793133470.5958393,
+    "hash": "11e34f1fae62755e58db46289ec9b9c5"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\crates\\ups-app\\src\\state.rs": {
+    "mtime": 1793138677.515882,
+    "hash": "aa74b2ae13024f1ff83b6058b41540ba"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\crates\\ups-app\\src\\web.rs": {
+    "mtime": 1793131626.9488058,
+    "hash": "33055e082e5f5badb6663416147bc054"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\crates\\ups-app\\web\\static\\js\\common.js": {
+    "mtime": 1793046072.3371856,
+    "hash": "2a8b6c6e2936bf4b4717d902859ebde6"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\crates\\ups-app\\web\\static\\js\\fractals.js": {
+    "mtime": 1793046072.3392162,
+    "hash": "4a1d0d978fd6b14774e7d795e22eef05"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\crates\\ups-app\\web\\static\\js\\host.js": {
+    "mtime": 1793046072.3428695,
+    "hash": "3ab449b27ef14c5c28027c13c6068342"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\crates\\ups-app\\web\\static\\js\\phone.js": {
+    "mtime": 1793046072.3464046,
+    "hash": "113171bfcf362077a6eb50f1f3559ea4"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\crates\\ups-app\\web\\static\\js\\tv.js": {
+    "mtime": 1793046072.340809,
+    "hash": "70c665c56b80fa625e1f17b1b83b5524"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\crates\\ups-app\\web\\static\\vendor\\socket.io.min.js": {
+    "mtime": 1793046072.3308835,
+    "hash": "777eb8fd4f8320b6e5cc9a7159bdec6a"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\crates\\ups-cli\\src\\main.rs": {
+    "mtime": 1793044844.6355512,
+    "hash": "313695532d937897df5b2875ae8d0f78"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\crates\\ups-core\\src\\capture.rs": {
+    "mtime": 1793047075.2303877,
+    "hash": "0ceb6cf991056360f21d325fe2d8af92"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\crates\\ups-core\\src\\catalog.rs": {
+    "mtime": 1793096268.7355354,
+    "hash": "8e9ae73ba260ccc3c6b38e617aad3e18"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\crates\\ups-core\\src\\chart.rs": {
+    "mtime": 1793047193.0421863,
+    "hash": "0cab2b47677a8e05257df2641310e42e"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\crates\\ups-core\\src\\decode.rs": {
+    "mtime": 1793045615.0689108,
+    "hash": "1e1d85ecffc83dcfbdf6ce8bacc26043"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\crates\\ups-core\\src\\layout.rs": {
+    "mtime": 1793042894.4398093,
+    "hash": "9af63a4c4a366779b510b819815afae3"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\crates\\ups-core\\src\\lib.rs": {
+    "mtime": 1793137876.582729,
+    "hash": "65063a03ee64c4530da5f3eaa1e58e10"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\crates\\ups-core\\src\\pitch.rs": {
+    "mtime": 1793042849.420254,
+    "hash": "e5972065365d8ce25175dbc24d517634"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\crates\\ups-core\\src\\romanize.rs": {
+    "mtime": 1793137870.4020438,
+    "hash": "eb517984fbf7390ca83204069002f136"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\crates\\ups-core\\src\\scoring.rs": {
+    "mtime": 1793046147.5067656,
+    "hash": "4b9952c9db74fa6403c15803b452ea39"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\crates\\ups-core\\src\\session.rs": {
+    "mtime": 1793127488.7415235,
+    "hash": "24691200cb6e73f2a5c5f1a6a5f78957"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\crates\\ups-core\\tests\\core.rs": {
+    "mtime": 1793138106.315398,
+    "hash": "cf49d16e9cbdf693b039a2b04819d582"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\crates\\ups-play\\src\\main.rs": {
+    "mtime": 1793047054.825627,
+    "hash": "9dc1a14d5992256d0af3ac991689a082"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\crates\\ups-prep\\src\\align.rs": {
+    "mtime": 1793054876.3109462,
+    "hash": "7030448f75d742eccc47fd9a8584990c"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\crates\\ups-prep\\src\\artwork.rs": {
+    "mtime": 1793062987.239165,
+    "hash": "7f354c8b8604ea5febe96409e0af951b"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\crates\\ups-prep\\src\\asr.rs": {
+    "mtime": 1793099997.9657874,
+    "hash": "b750f7d719bbf08ab37955c52dbb65b7"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\crates\\ups-prep\\src\\ff.rs": {
+    "mtime": 1793131366.2174442,
+    "hash": "3f8fea9a8860bc058e7bb21e4a5851a7"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\crates\\ups-prep\\src\\genchart.rs": {
+    "mtime": 1793137884.9298937,
+    "hash": "6c033ebf48fe5a25be0b2549d0917d6b"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\crates\\ups-prep\\src\\gui.rs": {
+    "mtime": 1793131275.0728326,
+    "hash": "845be2626b6d29929b384a70bc95e71f"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\crates\\ups-prep\\src\\lyrics.rs": {
+    "mtime": 1793054866.38404,
+    "hash": "43495077ab49baa2c2f1ab7e2fa13e63"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\crates\\ups-prep\\src\\main.rs": {
+    "mtime": 1793131176.83971,
+    "hash": "17eb852a5b4f1c21df81e094ceb80368"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\crates\\ups-prep\\src\\mel.rs": {
+    "mtime": 1793060729.6042564,
+    "hash": "dca590dbafd027fecffb1e686830803f"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\crates\\ups-prep\\src\\models.rs": {
+    "mtime": 1793100023.346679,
+    "hash": "14b53aac8bdede47ff0c24c7376fc850"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\crates\\ups-prep\\src\\rmvpe.rs": {
+    "mtime": 1793063807.1188405,
+    "hash": "a3d8d9cbab30320515c0c2d815b65790"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\crates\\ups-prep\\src\\separate.rs": {
+    "mtime": 1793099997.2518141,
+    "hash": "e2d9876626fae36681ae695af71fc47b"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\crates\\ups-prep\\src\\wordmap.rs": {
+    "mtime": 1793058447.6911395,
+    "hash": "ac6fa03f04d28d0cb565490655b9ed6b"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\crates\\ups-tv\\src\\driver.rs": {
+    "mtime": 1793136055.2842836,
+    "hash": "d5a507386ed26f48759dcf163b4cb985"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\crates\\ups-tv\\src\\lib.rs": {
+    "mtime": 1793134538.274097,
+    "hash": "14534f752605969abc79ea73c8dbacb6"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\crates\\ups-tv\\src\\main.rs": {
+    "mtime": 1793129537.827396,
+    "hash": "cc626441f4eaf8675e766a34eae15521"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\crates\\ups-tv\\src\\render.rs": {
+    "mtime": 1793136054.265768,
+    "hash": "dc6f4a5f23f1c5d3720c7ec39b72abcd"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\crates\\ups-tv\\src\\text.rs": {
+    "mtime": 1793137915.9810386,
+    "hash": "1e43dab3bb1f1cab4e90b22290994c7b"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\crates\\ups-tv\\src\\video.rs": {
+    "mtime": 1793132772.6470177,
+    "hash": "41fbd9793f9313d8085f0e6c8da9e0e9"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\crates\\ups-tv\\src\\viz.rs": {
+    "mtime": 1793134506.5696535,
+    "hash": "bee04aa8fa23a0284bf2cf737cfe677f"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\models\\sherpa-onnx-v2.0.1-win-x64-shared-MD-Release\\include\\sherpa-onnx\\c-api\\c-api.h": {
+    "mtime": 1793036098.0,
+    "hash": "8a60254af3ac51e1b6f27962ae1a4fa3"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\models\\sherpa-onnx-v2.0.1-win-x64-shared-MD-Release\\include\\sherpa-onnx\\c-api\\cxx-api.h": {
+    "mtime": 1793036098.0,
+    "hash": "d2f901fe77bd2852060fff76ebcf3f92"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\README.md": {
+    "mtime": 1793100099.5486765,
+    "hash": "107ec998e82f81165f0308abe8d5a923"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\crates\\ups-app\\web\\templates\\base.html": {
+    "mtime": 1793046072.267577,
+    "hash": "ae7f76294ae1acd430243094444e0d73"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\crates\\ups-app\\web\\templates\\host.html": {
+    "mtime": 1793046072.2712781,
+    "hash": "a131a3834f47aea5dd46ef035092c702"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\crates\\ups-app\\web\\templates\\host_gate.html": {
+    "mtime": 1793046072.2729454,
+    "hash": "5ac07547dff8f365310c6c2eececa1fc"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\crates\\ups-app\\web\\templates\\phone.html": {
+    "mtime": 1793046072.2749243,
+    "hash": "63ca68f5907177790a4b20330895482d"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\crates\\ups-app\\web\\templates\\tv.html": {
+    "mtime": 1793046072.2690718,
+    "hash": "194923e96e24011979cae758b0d40cde"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\models\\sherpa-onnx-whisper-tiny\\test_wavs\\trans.txt": {
+    "mtime": 1720877345.0,
+    "hash": "2b4453469052e1fd53be01f48d588f9b"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\ups-test\\Rick Astley - Never Gonna Give You Up\\Rick Astley - Never Gonna Give You Up.jpg": {
+    "mtime": 1793062578.3779824,
+    "hash": "ddfcf4acf70439d5b0e2521b593fae00"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\models\\sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8\\test_wavs\\de.wav": {
+    "mtime": 1755336483.0,
+    "hash": "18b6271f8246146435470f7a379a514a"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\models\\sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8\\test_wavs\\en.wav": {
+    "mtime": 1755336483.0,
+    "hash": "3187878a258f3b0212401214d0f30551"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\models\\sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8\\test_wavs\\es.wav": {
+    "mtime": 1755336483.0,
+    "hash": "dcd5c88c30ed48e09563d831811d5f10"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\models\\sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8\\test_wavs\\fr.wav": {
+    "mtime": 1755336483.0,
+    "hash": "005325839e8f2e79eda4d46b8263ef5d"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\models\\sherpa-onnx-whisper-tiny\\test_wavs\\0.wav": {
+    "mtime": 1720877345.0,
+    "hash": "188e353b8d0416ca7d788b8f00f51fe7"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\models\\sherpa-onnx-whisper-tiny\\test_wavs\\1.wav": {
+    "mtime": 1720877345.0,
+    "hash": "a8b485dc86756f61c8cc856fa189e68d"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\models\\sherpa-onnx-whisper-tiny\\test_wavs\\8k.wav": {
+    "mtime": 1720877345.0,
+    "hash": "32d05421f2362ea6fa999c4f791ca558"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\ups-test\\FX Test - Demo Song\\fx-demo.inst.mp4": {
+    "mtime": 1793053334.789057,
+    "hash": "60a36c705ac0bd1e07b2f5761b2c66a0"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\ups-test\\FX Test - Demo Song\\fx-demo.mp4": {
+    "mtime": 1793053334.4951587,
+    "hash": "60a36c705ac0bd1e07b2f5761b2c66a0"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\ups-test\\Rick Astley - Never Gonna Give You Up\\Rick Astley - Never Gonna Give You Up.inst.mp4": {
+    "mtime": 1793062445.6095798,
+    "hash": "3cf302f23265e700d0502bb53f08cd83"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\ups-test\\Rick Astley - Never Gonna Give You Up\\Rick Astley - Never Gonna Give You Up.mp4": {
+    "mtime": 1793062361.7898512,
+    "hash": "2ed5941e464fc033b1a8101f856813f4"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\ups-test\\Rick Astley - Never Gonna Give You Up\\Rick Astley - Never Gonna Give You Up.vocals.wav": {
+    "mtime": 1793062433.1892054,
+    "hash": "8674acbd2bee807a1a9cd048e6e6b714"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\ups-test\\unknown - yt-dQw4w9WgXcQ\\yt-dQw4w9WgXcQ.inst.mp4": {
+    "mtime": 1793058622.4061143,
+    "hash": "e68e9fdfb002676782c694422019b7d7"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\ups-test\\unknown - yt-dQw4w9WgXcQ\\yt-dQw4w9WgXcQ.mp4": {
+    "mtime": 1793061852.0917213,
+    "hash": "507f6da3e07a948f6fdf4ac913faa305"
+  },
+  "I:\\AI\\ultra-pi-star-rust\\ups-test\\unknown - yt-dQw4w9WgXcQ\\yt-dQw4w9WgXcQ.vocals.wav": {
+    "mtime": 1793058600.637453,
+    "hash": "8674acbd2bee807a1a9cd048e6e6b714"
+  }
+}

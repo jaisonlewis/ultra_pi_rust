@@ -38,6 +38,9 @@ pub struct App {
     pub paused: std::sync::atomic::AtomicBool,
     /// host nudge mailbox for the native-TV session (absolute offset)
     pub sync_override: Mutex<Option<f64>>,
+    /// host romaji-flip mailbox — the native-TV loop rebuilds its
+    /// lyric display text when this lands
+    pub rom_override: Mutex<Option<bool>>,
     /// POST /playback/resync flag the native-TV loop drains
     pub resync_req: std::sync::atomic::AtomicBool,
     /// pw-loopback speaker monitor — None off-PipeWire hosts
@@ -88,6 +91,7 @@ impl ups_tv::Driver for App {
             singer,
             tracks: e.tracks.clone(),
             sync_offset: self.st.sync_offset(it.entry_id),
+            lyrics_rom: it.lyrics_rom.map(|v| v != 0).unwrap_or(false),
         })
     }
 
@@ -149,6 +153,10 @@ impl ups_tv::Driver for App {
 
     fn take_sync_override(&self) -> Option<f64> {
         self.sync_override.lock().unwrap().take()
+    }
+
+    fn take_rom_override(&self) -> Option<bool> {
+        self.rom_override.lock().unwrap().take()
     }
 
     fn take_resync_request(&self) -> bool {

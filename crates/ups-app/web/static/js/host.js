@@ -50,6 +50,7 @@ socket.on("now_playing", async (p) => {
   hasChart = !!(p && p.lyrics);
   $("#sync-controls").classList.toggle("hidden", !hasChart);
   $("#sync-status").textContent = "";
+  updateRomButton(p && p.lyrics);
   if (hasChart) {
     try {
       const r = await api("/api/playback/sync");
@@ -61,8 +62,27 @@ socket.on("now_playing", async (p) => {
 socket.on("lyrics", (lyr) => {
   hasChart = !!lyr;
   $("#sync-controls").classList.toggle("hidden", !hasChart);
+  updateRomButton(lyr);
   if (lyr && lyr.offset_ms != null)
     $("#sync-value").textContent = lyr.offset_ms;
+});
+
+/* host romaji toggle — live-swap native/latinized lyrics mid-song */
+function updateRomButton(lyr) {
+  const b = $("#btn-rom");
+  if (!lyr || !lyr.has_alt) {
+    b.classList.add("hidden");
+    return;
+  }
+  b.classList.remove("hidden");
+  b.classList.toggle("active", !!lyr.rom);
+}
+$("#btn-rom").addEventListener("click", async () => {
+  try {
+    const r = await api("/api/playback/rom", "POST", {});
+    $("#btn-rom").classList.toggle("active", !!r.rom);
+    toast(r.rom ? "Romaji lyrics" : "Original lyrics");
+  } catch (e) { toast(e.message, "error"); }
 });
 
 document.querySelectorAll("[data-sync]").forEach((b) =>

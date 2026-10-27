@@ -45,6 +45,8 @@ pub struct PlayItem {
     pub tracks: Vec<String>,
     /// persisted chart->media nudge for this entry (0 when untouched)
     pub sync_offset: f64,
+    /// render romanized lyric text when the chart carries `alt`
+    pub lyrics_rom: bool,
 }
 
 pub trait Driver: Send + Sync {
@@ -73,6 +75,10 @@ pub trait Driver: Send + Sync {
     /// A host nudge landed — apply this absolute offset to the live
     /// session (drains the mailbox; None = nothing pending).
     fn take_sync_override(&self) -> Option<f64> {
+        None
+    }
+    /// Host flipped romaji on/off mid-song — rebuild display text.
+    fn take_rom_override(&self) -> Option<bool> {
         None
     }
     /// A manual resync was requested (POST /playback/resync).
@@ -142,6 +148,33 @@ fn native_size() -> (usize, usize) {
 /// but keep one place so the format stays uniform
 macro_rules! tlog {
     ($($arg:tt)*) => { eprintln!("tv: {}", format!($($arg)*)) };
+}
+
+/// (phrases, notes) for the lyric card + lane, with note text swapped
+/// to its `alt` romanization when `rom` is on — the same swap
+/// `lane_payload` does server-side for browser TVs.
+fn display_text(c: &Chart, track: &str, rom: bool)
+    -> (Vec<chart::Phrase>, Vec<chart::Note>) {
+    let mut ph = c.phrases().get(track).cloned().unwrap_or_default();
+    let mut ns = c.tracks.get(track).cloned().unwrap_or_default();
+    if rom {
+        for p in ph.iter_mut() {
+            if let Some(a) = p.atext.clone() {
+                p.text = a;
+            }
+            for syl in p.syls.iter_mut() {
+                if let Some(a) = syl.at.clone() {
+                    syl.t = a;
+                }
+            }
+        }
+        for n in ns.iter_mut() {
+            if !n.alt.is_empty() {
+                n.text = n.alt.clone();
+            }
+        }
+    }
+    (ph, ns)
 }
 
 /// update_with_buffer can fail (compositor drops the surface, resize
@@ -484,13 +517,9 @@ fn play_item(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
         s.set_sync_offset(it.sync_offset);
         s
     });
-    let phrases = chart
+    let (mut phrases, mut notes) = chart
         .as_ref()
-        .and_then(|c| c.phrases().get(&tracks[0]).cloned())
-        .unwrap_or_default();
-    let notes = chart
-        .as_ref()
-        .and_then(|c| c.tracks.get(&tracks[0]).cloned())
+        .map(|c| display_text(c, &tracks[0], it.lyrics_rom))
         .unwrap_or_default();
     let beat_ms = chart
         .as_ref()
@@ -694,6 +723,14 @@ fn play_item(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
             if let Some(s) = &mut sess {
                 s.set_sync_offset(off);
                 gap_ms = s.base_ms;
+            }
+        }
+        // host romaji flip — rebuild the lyric display text live
+        if let Some(rom) = driver.take_rom_override() {
+            if let Some(c) = &chart {
+                let (ph, ns) = display_text(c, &tracks[0], rom);
+                phrases = ph;
+                notes = ns;
             }
         }
         if driver.take_resync_request() {

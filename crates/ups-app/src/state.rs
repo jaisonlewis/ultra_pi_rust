@@ -407,6 +407,16 @@ impl State {
         r
     }
 
+    /// Flip the romanized-lyrics flag on a queue item (host toggle).
+    pub fn set_item_rom(&self, item_id: i64, rom: bool) -> bool {
+        let mut q = self.queue.lock().unwrap();
+        if let Some(it) = q.iter_mut().find(|i| i.id == item_id) {
+            it.lyrics_rom = Some(rom as i64);
+            return true;
+        }
+        false
+    }
+
     // -- sync / settings ----------------------------------------------------
     /// Learned chart->media nudge for an entry (0 when untouched).
     pub fn sync_offset(&self, entry_id: i64) -> f64 {

@@ -946,6 +946,46 @@ async fn api_pb_sync(AxState(app): AxState<Arc<App>>, headers: HeaderMap,
         .into_response()
 }
 
+/// POST /api/playback/rom — host flips romaji/native lyrics mid-song.
+/// Updates the queue item's stored flag, pushes a fresh lyrics payload
+/// to every client, and mails the native renderer a rebuild request.
+async fn api_pb_rom(AxState(app): AxState<Arc<App>>,
+                    headers: HeaderMap,
+                    body: axum::body::Bytes)
+    -> impl IntoResponse {
+    let (sid, _) = ensure_sid(&app, &headers);
+    if !is_host(&app, &headers, &sid) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "host key required"})),
+        )
+            .into_response();
+    }
+    let Some(item) = app.st.now_playing() else {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "nothing playing"})),
+        )
+            .into_response();
+    };
+    let rom = serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|b| b.get("rom").and_then(|v| v.as_bool()))
+        .unwrap_or(!item.lyrics_rom.map(|v| v != 0).unwrap_or(false));
+    app.st.set_item_rom(item.id, rom);
+    if let Some(sing) = app.sing.lock().unwrap().as_mut() {
+        sing.lyrics_rom = rom;
+    }
+    *app.rom_override.lock().unwrap() = Some(rom);
+    if let Some(fresh) = app.st.now_playing() {
+        if let Some(lyr) = lyrics_payload_for(&app, &fresh, fresh.entry_id) {
+            let _ = app.io.emit("lyrics", &lyr).await;
+        }
+    }
+    app.st.persist();
+    Json(json!({"ok": true, "rom": rom})).into_response()
+}
+
 /// POST /api/playback/resync — drop prior sync state and collect ~10s
 /// of fresh room audio before re-solving (host or current singer).
 async fn api_pb_resync(AxState(app): AxState<Arc<App>>,
@@ -1768,6 +1808,7 @@ pub fn router(app: Arc<App>, sio_layer: socketioxide::layer::SocketIoLayer) -> R
         .route("/api/playback/sync",
                get(api_pb_sync_get).post(api_pb_sync))
         .route("/api/playback/resync", post(api_pb_resync))
+        .route("/api/playback/rom", post(api_pb_rom))
         .route("/api/playback/autosync", post(api_pb_autosync))
         // mic/audio
         .route("/api/mic", get(api_mic).post(api_mic_set))

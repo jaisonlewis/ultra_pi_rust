@@ -66,6 +66,9 @@ fn resolve(args: &[String]) -> Option<PlayItem> {
         singer: "you".into(),
         tracks: vec!["P1".into()],
         sync_offset: 0.0,
+        lyrics_rom: std::env::var("UPS_ROMAJI")
+            .map(|v| v != "0")
+            .unwrap_or(false),
     })
 }
 

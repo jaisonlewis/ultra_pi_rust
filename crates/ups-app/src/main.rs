@@ -180,6 +180,7 @@ fn main() {
                 native_tv,
                 paused: std::sync::atomic::AtomicBool::new(false),
                 sync_override: Mutex::new(None),
+                rom_override: Mutex::new(None),
                 resync_req: std::sync::atomic::AtomicBool::new(false),
                 monitor: mon,
             });
