@@ -102,22 +102,35 @@ External tools (all cross-platform): `ffmpeg`, `ffprobe`, `yt-dlp`.
 The ML stages use external sherpa-onnx binaries plus ONNX models —
 no Python or ML-framework installs:
 
+The easiest way to get them is built in — downloads + unpacks
+everything, platform-aware, idempotent, resumable by re-running:
+
+```
+ups-prep models [--models ./models]   # ~900 MB total
+# or the "Download models" button in the GUI
+```
+
 ```
 models/
-  bin/                                     sherpa-onnx binaries
-    sherpa-onnx-offline-source-separation  vocal separation
-    sherpa-onnx-offline                    ASR
+  sherpa-onnx-v2.0.1-<platform>-shared*/   sherpa-onnx binaries
+    bin/sherpa-onnx-offline-source-separation   vocal separation
+        sherpa-onnx-offline                      ASR
   sherpa-onnx-spleeter-2stems-int8/        separation models
   sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/   ASR model
   rmvpe.onnx                               melody extraction
 ```
 
+Binaries resolve from `models/bin/` (if you lay them out yourself),
+any `models/sherpa-onnx-*/bin/` (the downloader's layout — keeps the
+shared libs next to the exes), or PATH.
+
+Manual setup is still fine — fetch the pieces into `models/` with
+this layout and `ups-prep` will find them:
+
 ```
 # sherpa-onnx binaries — grab the release for your OS
 #   (win-x64 / linux-x64+aarch64 / macos-x64+arm64 all exist):
 #   https://github.com/k2-fsa/sherpa-onnx/releases
-# copy sherpa-onnx-offline[-source-separation] + shared libs into
-# models/bin/
 
 # spleeter int8 separation models:
 curl -LO https://github.com/k2-fsa/sherpa-onnx/releases/download/\
@@ -129,8 +142,8 @@ curl -LO https://github.com/k2-fsa/sherpa-onnx/releases/download/\
 asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8.tar.bz2
 tar xjf sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8.tar.bz2
 
-# rmvpe pitch model — same file the Python pipeline uses:
-#   ultrapistar/models/rmvpe.onnx  →  models/rmvpe.onnx
+# rmvpe pitch model — a release asset on this repo:
+#   ultra_pi_rust → releases → v0.1.0 → rmvpe.onnx → models/rmvpe.onnx
 ```
 
 **ASR is Parakeet TDT, not Whisper** — a deliberate choice: TDT heads

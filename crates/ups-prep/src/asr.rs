@@ -8,17 +8,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn asr_bin(models: &Path) -> Option<PathBuf> {
-    let name = if cfg!(windows) {
+    crate::models::find_bin(models, if cfg!(windows) {
         "sherpa-onnx-offline.exe"
     } else {
         "sherpa-onnx-offline"
-    };
-    let local = models.join("bin").join(name);
-    if local.exists() {
-        return Some(local);
-    }
-    Command::new(name).arg("--help").output().ok()
-        .map(|_| PathBuf::from(name))
+    })
 }
 
 /// Model dir holding encoder/decoder/joiner int8 ONNX + tokens.txt.

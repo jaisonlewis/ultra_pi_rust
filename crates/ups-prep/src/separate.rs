@@ -12,23 +12,14 @@ use crate::ff;
 
 const SR: u32 = 44100;
 
-/// Locate the separation binary: PATH, then `<models>/bin/`.
+/// Locate the separation binary: `<models>/bin/`, unpacked
+/// `sherpa-onnx-*/bin/`, then PATH.
 fn sep_bin(models: &Path) -> Option<PathBuf> {
-    let name = if cfg!(windows) {
+    crate::models::find_bin(models, if cfg!(windows) {
         "sherpa-onnx-offline-source-separation.exe"
     } else {
         "sherpa-onnx-offline-source-separation"
-    };
-    let local = models.join("bin").join(name);
-    if local.exists() {
-        return Some(local);
-    }
-    // PATH lookup via a cheap probe
-    Command::new(name)
-        .arg("--help")
-        .output()
-        .ok()
-        .map(|_| PathBuf::from(name))
+    })
 }
 
 /// True when the spleeter int8 pair + binary are both available.

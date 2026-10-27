@@ -11,6 +11,12 @@ use eframe::egui;
 const DONE: &str = "job://done";
 const ERR: &str = "job://error ";
 
+enum Job {
+    Prep,
+    Batch,
+    Models,
+}
+
 pub fn run() -> anyhow::Result<()> {
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -83,18 +89,18 @@ impl PrepApp {
         }
     }
 
-    fn start(&mut self, batch: bool) {
+    fn start(&mut self, job: Job) {
         let (tx, rx) = channel();
         crate::set_log_sink(Some(tx.clone()));
         self.rx = Some(rx);
         self.busy = true;
         self.status = "working…".into();
-        let args = self.args(batch);
+        let args = self.args(matches!(job, Job::Batch));
         std::thread::spawn(move || {
-            let r = if batch {
-                crate::run_batch(&args)
-            } else {
-                crate::prep(&args)
+            let r = match job {
+                Job::Prep => crate::prep(&args),
+                Job::Batch => crate::run_batch(&args),
+                Job::Models => crate::models::download(&args.models),
             };
             let _ = tx.send(match r {
                 Ok(()) => DONE.to_string(),
@@ -228,7 +234,7 @@ impl eframe::App for PrepApp {
                         "download/normalize/separate/chart this song")
                     .clicked()
                 {
-                    self.start(false);
+                    self.start(Job::Prep);
                 }
                 let batch_ok = !self.library.trim().is_empty();
                 if ui
@@ -240,7 +246,17 @@ impl eframe::App for PrepApp {
                          every generated chart under the library")
                     .clicked()
                 {
-                    self.start(true);
+                    self.start(Job::Batch);
+                }
+                if ui
+                    .add_enabled(can_act,
+                                 egui::Button::new("Download models"))
+                    .on_hover_text(
+                        "fetch sherpa binaries + spleeter + parakeet \
+                         + rmvpe (~900 MB) into the models dir")
+                    .clicked()
+                {
+                    self.start(Job::Models);
                 }
             });
 

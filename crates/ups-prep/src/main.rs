@@ -19,6 +19,7 @@ mod genchart;
 mod gui;
 mod lyrics;
 mod mel;
+mod models;
 mod rmvpe;
 mod separate;
 mod wordmap;
@@ -41,11 +42,12 @@ macro_rules! say {
     ($($arg:tt)*) => {{
         let msg = format!($($arg)*);
         println!("{msg}");
-        if let Some(tx) = LOG_TX.lock().unwrap().as_ref() {
+        if let Some(tx) = crate::LOG_TX.lock().unwrap().as_ref() {
             let _ = tx.send(msg);
         }
     }};
 }
+pub(crate) use say;
 
 struct Args {
     source: String,
@@ -58,6 +60,8 @@ struct Args {
     no_separate: bool,
     /// `batch` mode — regenerate charts across a whole library.
     batch: bool,
+    /// `models` mode — download the model/binary pack into --models.
+    dl_models: bool,
     /// open the native window instead of running the CLI pipeline
     gui: bool,
 }
@@ -76,11 +80,13 @@ fn parse_args() -> Result<Args> {
         guide: 0.15,
         no_separate: false,
         batch: false,
+        dl_models: false,
         gui: false,
     };
     while let Some(arg) = a.next() {
         match arg.as_str() {
             "batch" => args.batch = true,
+            "models" => args.dl_models = true,
             "--gui" => args.gui = true,
             "--library" => args.library = a.next().context("--library")?.into(),
             "--models" => args.models = a.next().context("--models")?.into(),
@@ -93,6 +99,8 @@ fn parse_args() -> Result<Args> {
                 println!(
                     "ups-prep <youtube-url | media-file> [opts]\n\
                      ups-prep batch --library DIR   regenerate charts\n\
+                     ups-prep models [--models DIR]  download the model \
+                     + binary pack\n\
                      \x20 --library DIR    stick root (default .)\n\
                      \x20 --models DIR     model dir (default ./models or \
                      $UPS_MODELS_DIR)\n\
@@ -115,7 +123,9 @@ fn parse_args() -> Result<Args> {
             s => args.source = s.to_string(),
         }
     }
-    if !args.batch && !args.gui && args.source.is_empty() {
+    if !args.batch && !args.gui && !args.dl_models
+        && args.source.is_empty()
+    {
         bail!("need a youtube url or media file (or --gui)");
     }
     Ok(args)
@@ -223,6 +233,9 @@ fn main() -> Result<()> {
     }
     if args.batch {
         return run_batch(&args);
+    }
+    if args.dl_models {
+        return models::download(&args.models);
     }
     prep(&args)
 }
