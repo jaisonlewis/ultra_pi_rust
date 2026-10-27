@@ -450,7 +450,7 @@ fn play_item(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
     let mic_tone = mic.as_ref().map(|m| Arc::clone(&m.tone));
     driver.emit("mic:state", &json!({"ok": mic.is_some()}));
 
-    let mut frame = vec![0u8; fw * fh * 3];
+    let mut frame = vec![0u32; fw * fh];
     let mut hit_flash_until = Instant::now();
     let mut last_tick = 0u64;
     let mut fx = Fx::new();
@@ -600,7 +600,9 @@ fn play_item(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
                 }
                 match p.rx.try_recv() {
                     Ok(f) => {
-                        frame = f;
+                        // hand the spent buffer back to the reader
+                        let old = std::mem::replace(&mut frame, f);
+                        let _ = p.ret_tx.try_send(old);
                         p.frames += 1;
                     }
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -734,9 +736,10 @@ fn play_item(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
                 );
             }
         }
-        // compose
+        // compose — the pipe hands frames in minifb's own bgr0
+        // layout, so the blit is one memcpy, not a 2M-pixel convert
         if pipe.is_some() {
-            render::blit_video(fb, &frame, fw, fh);
+            fb.copy_from_slice(&frame);
         } else {
             render::fill(fb, render::BG);
         }
