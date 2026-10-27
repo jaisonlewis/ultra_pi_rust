@@ -85,6 +85,13 @@ pub trait Driver: Send + Sync {
     fn idle_info(&self) -> (String, String) {
         (String::new(), String::new())
     }
+    /// The room's host code while nobody holds host — drives the
+    /// persistent "Host code: XXXX" chip on every TV surface. None =
+    /// a host is claimed, hide it; it comes back the moment they
+    /// step down.
+    fn host_badge(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Native panel resolution — the first DRM mode is the preferred one
@@ -281,6 +288,31 @@ fn sc(fh: usize) -> f32 {
     fh as f32 / 720.0
 }
 
+/// "Host code: XXXX" bottom-right — same contract as the browser TV's
+/// #host-badge: visible on every screen until a host claims the room,
+/// then hidden (and back the instant they release it).
+fn draw_host_badge(fb: &mut [u32], fw: usize, fh: usize,
+                   text: &mut Option<Text>, driver: &Arc<dyn Driver>) {
+    let (Some(key), Some(t)) = (driver.host_badge(), text.as_mut())
+    else {
+        return;
+    };
+    if key.is_empty() {
+        return;
+    }
+    let s = sc(fh);
+    let label = format!("Host code: {key}");
+    let px = (22.0 * s).max(11.0) as u32;
+    let w = t.width(&label, px) as i32;
+    let pad = (10.0 * s) as i32;
+    let bw = w + pad * 2;
+    let bh = px as i32 + pad * 2;
+    let x = fw as i32 - bw - (16.0 * s) as i32;
+    let y = fh as i32 - bh - (14.0 * s) as i32;
+    render::rect(fb, fw, fh, x, y, bw, bh, 0x000000, 170);
+    t.draw(fb, fw, fh, &label, x + pad, y + pad, px, render::TEXT);
+}
+
 fn draw_idle(fb: &mut [u32], fw: usize, fh: usize,
              text: &mut Option<Text>, driver: &Arc<dyn Driver>,
              fx: &mut Fx) {
@@ -367,6 +399,7 @@ fn draw_idle(fb: &mut [u32], fw: usize, fh: usize,
             }
         }
     }
+    draw_host_badge(fb, fw, fh, text, driver);
 }
 
 /// Copy `path` into /dev/shm so playback reads from RAM — the stick's
@@ -498,6 +531,7 @@ fn play_item(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
                            render::TEXT_DIM);
                 }
             }
+            draw_host_badge(fb, fw, fh, text, driver);
             present(window, fb, fw, fh);
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -838,6 +872,7 @@ fn play_item(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
             }
         }
         render::draw_particles(fb, fw, fh, &fx.parts, now_f32);
+        draw_host_badge(fb, fw, fh, text, driver);
 
         if !present(window, fb, fw, fh) {
             sink.stop();
@@ -858,7 +893,8 @@ fn play_item(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
                         .map(|f| f.score)
                 })
                 .unwrap_or(0);
-            results_card(window, fb, fw, fh, text, &it, sess.as_mut());
+            results_card(window, fb, fw, fh, text, driver,
+                         &it, sess.as_mut());
             driver.item_done(it.id, score);
             return;
         }
@@ -866,8 +902,8 @@ fn play_item(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
 }
 
 fn results_card(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
-                text: &mut Option<Text>, it: &PlayItem,
-                sess: Option<&mut Session>) {
+                text: &mut Option<Text>, driver: &Arc<dyn Driver>,
+                it: &PlayItem, sess: Option<&mut Session>) {
     let s = sc(fh);
     let fin = sess.map(|s| s.finish()).unwrap_or_default();
     let wait_until = Instant::now() + Duration::from_secs(8);
@@ -908,6 +944,7 @@ fn results_card(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
             }
         }
         render::draw_particles(fb, fw, fh, &confetti.parts, cnow);
+        draw_host_badge(fb, fw, fh, text, driver);
         present(window, fb, fw, fh);
         std::thread::sleep(Duration::from_millis(30));
     }

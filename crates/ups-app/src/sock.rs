@@ -135,6 +135,14 @@ impl ups_tv::Driver for App {
         (self.join_url.clone(), self.join_url.clone())
     }
 
+    fn host_badge(&self) -> Option<String> {
+        if self.st.host_performer_id.lock().unwrap().is_some() {
+            None
+        } else {
+            Some(self.st.host_key.clone())
+        }
+    }
+
     fn autosync_enabled(&self) -> bool {
         *self.st.autosync_mic.lock().unwrap()
     }
