@@ -369,31 +369,53 @@ fn draw_idle(fb: &mut [u32], fw: usize, fh: usize,
     }
 }
 
+/// Copy `path` into /dev/shm so playback reads from RAM — the stick's
+/// USB bandwidth is shared with catalog rescans and chart loads.
+/// Skipped silently when shm isn't there or the copy fails.
+fn stage_shm(path: &std::path::Path) -> Option<PathBuf> {
+    let name = path.file_name()?;
+    let dst = PathBuf::from("/dev/shm").join(format!(
+        "ups-{}-{}", std::process::id(), name.to_string_lossy()
+    ));
+    if std::fs::copy(path, &dst).is_err() {
+        let _ = std::fs::remove_file(&dst); // drop a partial copy
+        return None;
+    }
+    Some(dst)
+}
+
+/// RAII cleanup for shm-staged media — removed when play_item returns.
+struct Staged(Option<PathBuf>);
+impl Drop for Staged {
+    fn drop(&mut self) {
+        if let Some(p) = self.0.take() {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
 fn play_item(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
              text: &mut Option<Text>,
              driver: &Arc<dyn Driver>, it: PlayItem) {
     let s = sc(fh);
-    // audio is the master clock — same rule as the web TV
-    let src = match StreamingSource::open(&it.audio) {
-        Ok(s) => s,
-        Err(e) => {
-            driver.item_error(it.id, &format!("decode: {e}"));
-            std::thread::sleep(Duration::from_millis(300));
-            return;
-        }
-    };
-    let dur = src.total_duration().unwrap_or(Duration::ZERO);
-    let (_stream, handle) = match OutputStream::try_default() {
-        Ok(v) => v,
-        Err(e) => {
-            driver.item_error(it.id, &format!("audio out: {e}"));
-            return;
-        }
-    };
-    let sink = Sink::try_new(&handle).expect("sink");
-    sink.pause(); // held until the countdown finishes
-    sink.append(src);
-    sink.set_volume(driver.volume() as f32);
+    // Preload during the intermission countdown: decode the whole audio
+    // track to PCM in RAM (the sink's stream can never underrun) and
+    // stage the video into /dev/shm so reads don't contend with the USB
+    // stick's chart/rescan traffic. Runs on its own thread — the
+    // countdown window absorbs the work, worst case a few seconds late.
+    let audio_p = it.audio.clone();
+    let video_p = it.video.clone();
+    let preload = std::thread::spawn(move || {
+        let src = StreamingSource::open(&audio_p).ok();
+        let pcm = src.map(|s| {
+            let ch = s.channels();
+            let rate = s.sample_rate();
+            (s.collect::<Vec<f32>>(), ch, rate)
+        });
+        let shm = video_p.as_ref().and_then(|v| stage_shm(v));
+        (pcm, shm)
+    });
+    let staged = Staged(None);
 
     let chart: Option<Chart> =
         it.chart.as_ref().map(|p| chart::load_chart(p));
@@ -481,14 +503,44 @@ fn play_item(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
         }
     }
 
+    // countdown over — collect the preload. PCM decode wins when it
+    // succeeded; anything else falls back to the streaming source.
+    let (pcm, shm) = preload.join().unwrap_or((None, None));
+    let mut staged = staged;
+    staged.0 = shm;
     let mut pipe = if !it.audio_only {
-        it.video
-            .as_ref()
+        staged.0.as_ref().or(it.video.as_ref())
             .and_then(|v| VideoPipe::open(v, fw, fh, 25.0))
     } else {
         None
     };
     tlog!("video pipe: {}", if pipe.is_some() { "open" } else { "none" });
+
+    // audio is the master clock — same rule as the web TV
+    let src: Box<dyn Source<Item = f32> + Send> = match pcm {
+        Some((samples, ch, rate)) if !samples.is_empty() => Box::new(
+            rodio::buffer::SamplesBuffer::new(ch, rate, samples),
+        ),
+        _ => match StreamingSource::open(&it.audio) {
+            Ok(s) => Box::new(s),
+            Err(e) => {
+                driver.item_error(it.id, &format!("decode: {e}"));
+                std::thread::sleep(Duration::from_millis(300));
+                return;
+            }
+        },
+    };
+    let dur = src.total_duration().unwrap_or(Duration::ZERO);
+    let (_stream, handle) = match OutputStream::try_default() {
+        Ok(v) => v,
+        Err(e) => {
+            driver.item_error(it.id, &format!("audio out: {e}"));
+            return;
+        }
+    };
+    let sink = Sink::try_new(&handle).expect("sink");
+    sink.append(src);
+    sink.set_volume(driver.volume() as f32);
     let mut stat_at = Instant::now();
     let mut video_done = pipe.is_none();
     let mut audio_done_at: Option<Instant> = None;

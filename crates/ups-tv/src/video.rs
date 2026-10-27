@@ -19,14 +19,43 @@ pub struct VideoPipe {
     pub produced: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
+/// Optional hardware decode — `UPS_HWACCEL=v4l2m2m` on the Pi pushes
+/// h264 onto the VideoCore block instead of a CPU core. Off by default:
+/// a wrong hwaccel kills the whole picture, so it stays opt-in.
+fn hwaccel() -> &'static [&'static str] {
+    static HW: std::sync::OnceLock<Vec<&'static str>> =
+        std::sync::OnceLock::new();
+    HW.get_or_init(|| {
+        let name = std::env::var("UPS_HWACCEL").unwrap_or_default();
+        if name.is_empty() {
+            return Vec::new();
+        }
+        let listed = Command::new("ffmpeg")
+            .arg("-hwaccels")
+            .stderr(Stdio::null())
+            .output()
+            .ok()
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout).contains(name.as_str())
+            })
+            .unwrap_or(false);
+        if listed {
+            vec!["-hwaccel", Box::leak(name.into_boxed_str())]
+        } else {
+            Vec::new()
+        }
+    })
+}
+
 impl VideoPipe {
     /// ffmpeg decodes at `fps` to `w`x`h` rgb24. Returns None if ffmpeg
     /// can't be spawned (audio-only path handles that gracefully).
     pub fn open(path: &std::path::Path, w: usize, h: usize, fps: f64)
         -> Option<Self> {
         let mut child = Command::new("ffmpeg")
+            .args(["-v", "error"])
+            .args(hwaccel())
             .args([
-                "-v", "error",
                 "-i", &path.display().to_string(),
                 "-an",
                 "-vf", &format!("scale={w}:{h}:force_original_aspect_ratio=\
