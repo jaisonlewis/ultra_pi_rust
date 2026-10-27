@@ -514,9 +514,9 @@ fn play_item(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
     let mut target_score: f64 = 0.0;
     let mut cur_streak: i64 = 0;
     let song_start = Instant::now();
-    // pitch lane at the top like the browser TV (top 8vh, 26vh tall)
-    // — the HUD strip sits in the ~8% above it, lyrics anchor bottom
-    let lane_y = (fh as f64 * 0.10) as i32;
+    // pitch lane flush at the top of the screen — HUD text overlays
+    // its upper region (drawn after, on top); lyrics anchor bottom
+    let lane_y = 0;
     let lane_h = (fh as f64 * 0.24) as i32;
 
     // intermission countdown — sink is paused, so nothing is audible

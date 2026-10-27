@@ -185,7 +185,7 @@ pub fn draw_lane(fb: &mut [u32], fw: usize, fh: usize,
                  beat_ms: f64, pos_ms: f64, y: i32, h: i32,
                  window_ms: f64, sung: Option<i64>,
                  hit_flash: bool) {
-    rect(fb, fw, fh, 0, y, fw as i32, h, LANE_BG, 220);
+    rect(fb, fw, fh, 0, y, fw as i32, h, LANE_BG, 150);
     let (playhead_x, px_per_ms, tone_min, tone_max, row_h) =
         lane_geo(fw, h, window_ms);
 
