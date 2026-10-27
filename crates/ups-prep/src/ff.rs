@@ -218,32 +218,97 @@ pub fn deinterleave(inter: &[f32], ch: u16) -> Vec<Vec<f32>> {
     out
 }
 
+/// `ffmpeg -encoders` output, fetched once — used to shortlist HEVC
+/// encoders that are actually compiled into this binary.
+fn encoder_list() -> &'static str {
+    static LIST: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| {
+        Command::new("ffmpeg")
+            .args(["-hide_banner", "-encoders"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default()
+    })
+}
+
+/// HEVC encoder candidates in preference order — hardware first
+/// (NVENC/QSV/AMF/MF encode a song in seconds), libx265 always-last.
+/// `-tag:v hvc1` keeps the file openable by platform decoders.
+fn hevc_args() -> Vec<Vec<String>> {
+    let enc = encoder_list();
+    [
+        ("hevc_nvenc", vec!["-preset", "p5", "-b:v", "6M"]),
+        ("hevc_qsv", vec!["-b:v", "6M"]),
+        ("hevc_amf", vec!["-b:v", "6M"]),
+        ("hevc_mf", vec!["-b:v", "6M"]),
+        ("libx265", vec!["-preset", "fast", "-crf", "24"]),
+    ]
+    .iter()
+    .filter(|(name, _)| enc.contains(name))
+    .map(|(name, extra)| {
+        let mut v = vec!["-c:v".to_string(), name.to_string()];
+        v.extend(extra.iter().map(|s| s.to_string()));
+        v.extend(["-tag:v".to_string(), "hvc1".to_string()]);
+        v
+    })
+    .collect()
+}
+
 /// Remux the original video with a new audio stem — the karaoke-ready
 /// .inst.mp4 the TV plays. Audio-only media gets an audio-only output.
-pub fn karaoke_mp4(media: &Path, inst_stereo: &[f32], out: &Path)
-                   -> Result<()> {
+/// `hevc` re-encodes the video stream as HEVC instead of copying —
+/// the Pi 5 decodes that in hardware, h264 it can't.
+pub fn karaoke_mp4(media: &Path, inst_stereo: &[f32], out: &Path,
+                   hevc: bool) -> Result<()> {
     let tmp = std::env::temp_dir().join(format!(
         "ups-prep-{}.wav", std::process::id()));
     write_wav(&tmp, inst_stereo, 44100, 2)?;
-    let maps: Vec<String> = if has_real_video(media) {
+    let has_video = has_real_video(media);
+    let maps: Vec<String> = if has_video {
         ["-map", "0:v", "-map", "1:a", "-shortest"]
             .iter().map(|s| s.to_string()).collect()
     } else {
         vec!["-map".into(), "1:a".into()]
     };
-    let st = Command::new("ffmpeg")
-        .args(["-v", "error", "-y", "-i"])
-        .arg(media)
-        .args(["-i"])
-        .arg(&tmp)
-        .args(&maps)
-        .args(["-c:v", "copy", "-c:a", "aac", "-b:a", "192k"])
-        .arg(out)
-        .status()
-        .context("spawn karaoke remux")?;
+    let mut attempts: Vec<Vec<String>> = Vec::new();
+    if hevc && has_video {
+        attempts = hevc_args();
+        if attempts.is_empty() {
+            bail!("no hevc encoder in this ffmpeg");
+        }
+    }
+    if attempts.is_empty() {
+        attempts.push(vec!["-c:v".into(), "copy".into()]);
+    }
+    let mut last_err = String::new();
+    let mut ok = false;
+    for vc in &attempts {
+        let st = Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-i"])
+            .arg(media)
+            .args(["-i"])
+            .arg(&tmp)
+            .args(&maps)
+            .args(vc)
+            .args(["-c:a", "aac", "-b:a", "192k"])
+            .arg(out)
+            .status();
+        match st {
+            Ok(s) if s.success() => {
+                ok = true;
+                break;
+            }
+            Ok(s) => {
+                last_err = format!("{} exited {s}", vc.get(1)
+                    .map(|x| x.as_str()).unwrap_or("encoder"));
+            }
+            Err(e) => last_err = format!("spawn: {e}"),
+        }
+    }
     let _ = std::fs::remove_file(&tmp);
-    if !st.success() {
-        bail!("karaoke remux failed");
+    if !ok {
+        let _ = std::fs::remove_file(out); // drop a partial encode
+        bail!("karaoke remux failed: {last_err}");
     }
     Ok(())
 }

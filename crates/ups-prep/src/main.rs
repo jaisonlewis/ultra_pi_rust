@@ -58,6 +58,8 @@ struct Args {
     title: Option<String>,
     guide: f32,
     no_separate: bool,
+    /// encode .inst.mp4 as HEVC — the Pi 5 decodes it in hardware
+    hevc: bool,
     /// `batch` mode — regenerate charts across a whole library.
     batch: bool,
     /// `models` mode — download the model/binary pack into --models.
@@ -79,6 +81,7 @@ fn parse_args() -> Result<Args> {
         title: None,
         guide: 0.15,
         no_separate: false,
+        hevc: false,
         batch: false,
         dl_models: false,
         gui: false,
@@ -95,6 +98,7 @@ fn parse_args() -> Result<Args> {
             "--title" => args.title = Some(a.next().context("--title")?),
             "--guide" => args.guide = a.next().context("--guide")?.parse()?,
             "--no-separate" => args.no_separate = true,
+            "--hevc" => args.hevc = true,
             "-h" | "--help" => {
                 println!(
                     "ups-prep <youtube-url | media-file> [opts]\n\
@@ -110,6 +114,8 @@ fn parse_args() -> Result<Args> {
                      \x20 --guide F        guide-vocal level 0..1 \
                      (default 0.15)\n\
                      \x20 --no-separate    skip vocal separation\n\
+                     \x20 --hevc           encode .inst.mp4 as HEVC —\n\
+                     \x20                  hw-decoded on the Pi 5\n\
                      \x20 --gui            open the prep window\n\n\
                      batch re-runs ASR + RMVPE + genchart on every song\n\
                      whose .upsong was machine-generated (CREATOR\n\
@@ -287,7 +293,7 @@ fn prep(args: &Args) -> Result<()> {
                     stage("building karaoke track");
                     let mix = separate::karaoke_mix(
                         &vocals, &accomp, args.guide, 150.0);
-                    ff::karaoke_mp4(&media, &mix, &inst)?;
+                    ff::karaoke_mp4(&media, &mix, &inst, args.hevc)?;
                     stage("writing vocal stem");
                     let mono = separate::mono16(&vocals)?;
                     ff::write_wav(&voc, &mono, 16000, 1)?;

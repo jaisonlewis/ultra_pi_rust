@@ -40,6 +40,7 @@ struct PrepApp {
     chart: String,
     guide: f32,
     no_separate: bool,
+    hevc: bool,
     busy: bool,
     status: String,
     log: std::collections::VecDeque<String>,
@@ -58,6 +59,7 @@ impl Default for PrepApp {
             chart: String::new(),
             guide: 0.15,
             no_separate: false,
+            hevc: false,
             busy: false,
             status: String::new(),
             log: std::collections::VecDeque::new(),
@@ -84,6 +86,8 @@ impl PrepApp {
                 .then(|| self.title.trim().to_string()),
             guide: self.guide,
             no_separate: self.no_separate,
+            hevc: self.hevc,
+            dl_models: false,
             batch,
             gui: false,
         }
@@ -219,6 +223,11 @@ impl eframe::App for PrepApp {
                             .text("level"));
                         ui.checkbox(&mut self.no_separate,
                                     "skip vocal separation");
+                        ui.checkbox(&mut self.hevc,
+                                    "HEVC karaoke video")
+                            .on_hover_text(
+                                "encode .inst.mp4 as HEVC — the Pi 5 \
+                                 decodes it in hardware, h264 it can't");
                         ui.end_row();
                     });
             });
