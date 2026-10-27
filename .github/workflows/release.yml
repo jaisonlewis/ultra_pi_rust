@@ -1,0 +1,103 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            label: ups-win-x64
+            archive: zip
+          - os: ubuntu-latest
+            label: ups-linux-x64
+            archive: tar.gz
+          - os: macos-latest
+            label: ups-macos-arm64
+            archive: tar.gz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: linux system deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev libxkbcommon-dev libwayland-dev \
+            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev \
+            libxcb-xfixes0-dev pkg-config
+
+      - name: build
+        run: >
+          cargo build --release
+          -p ups-prep -p ups-app -p ups-cli -p ups-play
+          --features ups-prep/gui
+
+      - name: stage package
+        shell: bash
+        run: |
+          mkdir -p stage
+          cd target/release
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp ups-prep.exe ups-app.exe ups-cli.exe ups-play.exe \
+               DirectML.dll ../../stage/
+          else
+            cp ups-prep ups-app ups-cli ups-play ../../stage/
+          fi
+          cd ../..
+          cat > stage/README.txt <<'EOF'
+          Ultra Pi Star — karaoke appliance
+
+          ups-prep    Song prep station. --gui opens the window
+                      (double-click on Windows); CLI:
+                      ups-prep <youtube-url|file> --library <root>
+                      ups-prep batch --library <root>
+          ups-app     Karaoke server + native TV:
+                      ups-app --tv --media <library root>
+          ups-cli     Library scan/audit/info.
+          ups-play    Terminal karaoke player.
+
+          Requires ffmpeg/ffprobe/yt-dlp on PATH, plus the models/
+          folder for prep ML stages — see README.md in the repo
+          for the model download commands.
+          EOF
+
+      - name: package zip (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: >
+          Compress-Archive -Path stage\* -DestinationPath
+          ${{ matrix.label }}.zip -Force
+
+      - name: package tarball (unix)
+        if: runner.os != 'Windows'
+        run: tar -czf ${{ matrix.label }}.tar.gz -C stage .
+
+      - name: upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.label }}
+          path: |
+            ${{ matrix.label }}.zip
+            ${{ matrix.label }}.tar.gz
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: publish to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ matrix.label }}.zip
+            ${{ matrix.label }}.tar.gz
