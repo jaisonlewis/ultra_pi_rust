@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 
 pub fn available() -> bool {
     Command::new("wpctl")
-        .arg("--version")
+        .arg("status")
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
