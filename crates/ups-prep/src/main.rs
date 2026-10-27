@@ -424,8 +424,36 @@ fn run_batch(args: &Args) -> Result<()> {
 fn batch_one(args: &Args, song: &ups_core::catalog::Song) -> Result<bool> {
     let stem = song.media.file_stem().unwrap_or_default()
         .to_string_lossy().into_owned();
-    let dest = song.dir.join(format!("{stem}.upsong"));
+    // overwrite the generated chart in place — its filename may be
+    // 'Artist - Title.upsong', not '<media-stem>.upsong'
+    let dest = song.chart.clone()
+        .unwrap_or_else(|| song.dir.join(format!("{stem}.upsong")));
     let ana_path = song.dir.join(format!("{stem}.analysis.json"));
+    // folder names are the catalogued identity — chart headers may be
+    // polluted by a previous bad lyric pick (wrong record's title got
+    // baked in). Headers only fill in when the folder name is useless.
+    let (artist, title) = {
+        let bad = |s: &str| s.is_empty() || s == "unknown" || s == stem;
+        let (mut a, mut t) = (song.artist.clone(), song.title.clone());
+        if bad(&a) || bad(&t) {
+            if let Some(cp) = &song.chart {
+                let c = ups_core::chart::load_chart(cp);
+                if bad(&a) {
+                    if let Some(v) = c.headers.get("ARTIST")
+                        .filter(|s| !s.is_empty()) {
+                        a = v.clone();
+                    }
+                }
+                if bad(&t) {
+                    if let Some(v) = c.headers.get("TITLE")
+                        .filter(|s| !s.is_empty()) {
+                        t = v.clone();
+                    }
+                }
+            }
+        }
+        (a, t)
+    };
 
     // ASR — reuse the stored transcript when it's already a parakeet
     // pass; needle/empty/missing means re-transcribe
@@ -475,14 +503,14 @@ fn batch_one(args: &Args, song: &ups_core::catalog::Song) -> Result<bool> {
     let dur = ff::duration(&song.media).ok();
     let mut recs: Vec<lyrics::LyricRecord> = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    for (a, t) in lyrics::yt_candidates(&song.artist, &song.title) {
+    for (a, t) in lyrics::yt_candidates(&artist, &title) {
         if let Some(r) = lyrics::fetch(&a, &t, dur) {
             if seen.insert(format!("{}|{}", r.artist_name, r.track_name)) {
                 recs.push(r);
             }
         }
     }
-    let q = format!("{} {}", song.artist, song.title);
+    let q = format!("{artist} {title}");
     for r in lyrics::search(q.trim(), dur) {
         if seen.insert(format!("{}|{}", r.artist_name, r.track_name)) {
             recs.push(r);
@@ -510,7 +538,7 @@ fn batch_one(args: &Args, song: &ups_core::catalog::Song) -> Result<bool> {
                  r.synced.len(), r.artist_name, r.track_name);
     }
 
-    Ok(gen_chart(args, &song.media, &song.artist, &song.title,
+    Ok(gen_chart(args, &song.media, &artist, &title,
                  &asr_words, &dest, rec.as_ref()))
 }
 
