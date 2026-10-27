@@ -74,13 +74,46 @@ pub fn lookup(artist: &str, title: &str) -> Option<String> {
     itunes_art(artist, title).or_else(|| deezer_art(artist, title))
 }
 
-/// Download artwork to `dest` — remote lookup first, then a caller-
-/// supplied fallback (e.g. the yt-dlp thumbnail).
+/// Screengrab from the media ~20% in → `dest` (jpeg via ffmpeg).
+fn grab_frame(media: &Path, dest: &Path) -> bool {
+    let off = crate::ff::duration(media).ok()
+        .map(|d| (d * 0.2).clamp(5.0, 60.0))
+        .unwrap_or(10.0);
+    let ok = std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-y", "-ss", &format!("{off:.1}"),
+               "-i"]).arg(media)
+        .args(["-frames:v", "1", "-q:v", "4"])
+        .arg(dest)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    ok && dest.metadata().map(|m| m.len() > 2000).unwrap_or(false)
+}
+
+/// Artwork to `dest`. A screengrab wins where one is available — the
+/// provider's poster frame (YouTube thumb) or a frame grabbed from
+/// the media — matching what plays on the TV. Album art (iTunes →
+/// Deezer) is the fallback for audio-only sources.
 pub fn save(artist: &str, title: &str, dest: &Path,
-            fallback_url: Option<&str>) -> Result<bool> {
-    for url in [lookup(artist, title),
-                fallback_url.map(String::from)]
-        .into_iter().flatten() {
+            thumb_url: Option<&str>, media: Option<&Path>) -> Result<bool> {
+    if let Some(url) = thumb_url {
+        if let Ok(resp) = reqwest::blocking::Client::new()
+            .get(url).header("User-Agent", UA)
+            .timeout(std::time::Duration::from_secs(15)).send() {
+            if let Ok(bytes) = resp.bytes() {
+                if bytes.len() > 2000 {
+                    std::fs::write(dest, &bytes)?;
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    if let Some(m) = media {
+        if grab_frame(m, dest) {
+            return Ok(true);
+        }
+    }
+    if let Some(url) = lookup(artist, title) {
         if let Ok(resp) = reqwest::blocking::Client::new()
             .get(&url).header("User-Agent", UA)
             .timeout(std::time::Duration::from_secs(15)).send() {

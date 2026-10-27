@@ -332,7 +332,8 @@ fn main() -> Result<()> {
     let art = stem_path("jpg");
     if !art.exists() {
         match artwork::save(&artist, &title, &art,
-                            info.thumb_url.as_deref()) {
+                            info.thumb_url.as_deref(),
+                            Some(media.as_path())) {
             Ok(true) => println!("artwork: {}", art.display()),
             _ => eprintln!("artwork: none"),
         }
