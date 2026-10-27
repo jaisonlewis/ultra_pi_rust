@@ -125,6 +125,17 @@ fn main() {
     );
     eprintln!("ups-app: host key {}", st.host_key);
     eprintln!("ups-app: join url {}/", lan_addr(port));
+    // enlarge PipeWire buffers — the default ~5ms quantum xruns whenever
+    // video decode saturates a core. 1024 @48k ≈ 21ms: still well under
+    // perception, but deep enough to ride out CPU spikes.
+    #[cfg(target_os = "linux")]
+    {
+        let _ = std::process::Command::new("pw-metadata")
+            .args(["-n", "settings", "0", "clock.force-quantum", "1024"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
     // mic passthrough — singers hear themselves (PipeWire only)
     let mon = monitor::start();
     // restore the host's saved audio output (sink_name survives

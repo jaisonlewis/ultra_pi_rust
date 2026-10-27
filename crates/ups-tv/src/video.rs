@@ -58,7 +58,18 @@ impl VideoPipe {
     /// can't be spawned (audio-only path handles that gracefully).
     pub fn open(path: &std::path::Path, w: usize, h: usize, fps: f64)
         -> Option<Self> {
-        let mut child = Command::new("ffmpeg")
+        // decode is the heavyweight thread — run it at nice +10 so the
+        // PipeWire/rodio audio path always wins scheduling. Without this
+        // a saturated software-decode starves the sink -> audible xruns.
+        #[cfg(unix)]
+        let mut cmd = {
+            let mut c = Command::new("nice");
+            c.args(["-n", "10", "ffmpeg"]);
+            c
+        };
+        #[cfg(not(unix))]
+        let mut cmd = Command::new("ffmpeg");
+        let mut child = cmd
             .args(["-v", "error"])
             .args(hwaccel())
             .args([
