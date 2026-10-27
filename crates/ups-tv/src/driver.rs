@@ -98,7 +98,25 @@ pub trait Driver: Send + Sync {
 /// Native panel resolution — the first DRM mode is the preferred one
 /// on the Pi's HDMI out. Dev machines have no /sys/class/drm entry and
 /// fall back to 720p.
+/// `UPS_RENDER_RES=<height>` renders smaller and lets the compositor
+/// upscale — framebuffer work and ffmpeg's scale target shrink
+/// ~4x going 1080p->720p, the biggest single CPU lever we have.
 fn screen_size() -> (usize, usize) {
+    let mut wh = native_size();
+    if let Some(target) = std::env::var("UPS_RENDER_RES")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n >= 240)
+    {
+        if wh.1 > target {
+            wh.0 = wh.0 * target / wh.1;
+            wh.1 = target;
+        }
+    }
+    (wh.0 & !1, wh.1 & !1)
+}
+
+fn native_size() -> (usize, usize) {
     if let Ok(dir) = std::fs::read_dir("/sys/class/drm") {
         for e in dir.flatten() {
             let Ok(txt) = std::fs::read_to_string(e.path().join("modes"))
