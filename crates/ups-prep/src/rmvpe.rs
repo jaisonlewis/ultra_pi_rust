@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use ort::session::Session;
 use ort::value::Tensor;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use crate::mel::{self, HOP, SR};
 
@@ -28,8 +29,14 @@ fn model_path(models: &Path) -> PathBuf {
 
 /// 16k mono f32 → RMVPE curve.
 pub fn extract_curve(audio16: &[f32], models: &Path) -> Result<Curve> {
-    let env = ort::init().with_name("ups-prep").build()?;
-    let mut sess = Session::builder(&env)?
+    // ort allows exactly one Environment per process — share it
+    static ENV: OnceLock<ort::environment::Environment> =
+        OnceLock::new();
+    let env = ENV.get_or_init(|| {
+        ort::init().with_name("ups-prep").build()
+            .expect("ort environment")
+    });
+    let mut sess = Session::builder(env)?
         .commit_from_file(model_path(models))
         .context("load rmvpe.onnx")?;
     let mel = mel::log_mel(audio16);

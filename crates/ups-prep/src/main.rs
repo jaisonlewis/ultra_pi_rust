@@ -34,6 +34,8 @@ struct Args {
     title: Option<String>,
     guide: f32,
     no_separate: bool,
+    /// `batch` mode — regenerate charts across a whole library.
+    batch: bool,
 }
 
 fn parse_args() -> Result<Args> {
@@ -49,9 +51,11 @@ fn parse_args() -> Result<Args> {
         title: None,
         guide: 0.15,
         no_separate: false,
+        batch: false,
     };
     while let Some(arg) = a.next() {
         match arg.as_str() {
+            "batch" => args.batch = true,
             "--library" => args.library = a.next().context("--library")?.into(),
             "--models" => args.models = a.next().context("--models")?.into(),
             "--chart" => args.chart = Some(a.next().context("--chart")?.into()),
@@ -62,6 +66,7 @@ fn parse_args() -> Result<Args> {
             "-h" | "--help" => {
                 println!(
                     "ups-prep <youtube-url | media-file> [opts]\n\
+                     ups-prep batch --library DIR   regenerate charts\n\
                      \x20 --library DIR    stick root (default .)\n\
                      \x20 --models DIR     model dir (default ./models or \
                      $UPS_MODELS_DIR)\n\
@@ -70,7 +75,12 @@ fn parse_args() -> Result<Args> {
                      \x20 --title NAME     override title\n\
                      \x20 --guide F        guide-vocal level 0..1 \
                      (default 0.15)\n\
-                     \x20 --no-separate    skip vocal separation"
+                     \x20 --no-separate    skip vocal separation\n\n\
+                     batch re-runs ASR + RMVPE + genchart on every song\n\
+                     whose .upsong was machine-generated (CREATOR\n\
+                     ultrapistar-genchart) or missing; imported charts\n\
+                     are left alone. Reuses the stored transcript when\n\
+                     analysis.json already holds a parakeet pass."
                 );
                 std::process::exit(0);
             }
@@ -78,7 +88,7 @@ fn parse_args() -> Result<Args> {
             s => args.source = s.to_string(),
         }
     }
-    if args.source.is_empty() {
+    if !args.batch && args.source.is_empty() {
         bail!("need a youtube url or media file");
     }
     Ok(args)
@@ -165,6 +175,9 @@ fn split_artist_title(channel: &str, yt_title: &str) -> (String, String) {
 
 fn main() -> Result<()> {
     let args = parse_args()?;
+    if args.batch {
+        return run_batch(&args);
+    }
 
     // provisional dir — download first so yt metadata names it
     let dl_dir = std::env::temp_dir().join(format!(
@@ -368,15 +381,165 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Generate a chart from ASR word onsets + RMVPE pitch on the vocal
-/// stem (or raw media when no stem exists).
+/// `ups-prep batch --library <root>` — regenerate machine-made charts
+/// with the current ASR+pitch stack. Songs whose .upsong was imported
+/// (not marked ultrapibar-genchart/generated) are left alone.
+fn run_batch(args: &Args) -> Result<()> {
+    let songs = ups_core::catalog::scan(&args.library);
+    let total = songs.len();
+    let (mut redone, mut skipped, mut failed) = (0u32, 0u32, 0u32);
+    for (i, song) in songs.iter().enumerate() {
+        // an imported (non-generated) chart is human-timed — keep it
+        if let Some(cp) = &song.chart {
+            let c = ups_core::chart::load_chart(cp);
+            let gen = c.headers.get("CREATOR")
+                    .is_some_and(|v| v.contains("genchart"))
+                || c.source["type"].as_str() == Some("generated");
+            if !gen {
+                skipped += 1;
+                continue;
+            }
+        }
+        if !song.media.is_file() {
+            skipped += 1;
+            continue;
+        }
+        println!("[{}/{}] {} — {}", i + 1, total,
+                 song.artist, song.title);
+        match batch_one(args, song) {
+            Ok(true) => redone += 1,
+            Ok(false) => skipped += 1,
+            Err(e) => {
+                eprintln!("  failed: {e}");
+                failed += 1;
+            }
+        }
+    }
+    println!("batch done: {redone} regenerated, {skipped} skipped, \
+              {failed} failed");
+    Ok(())
+}
+
+/// Re-chart one library song; Ok(false) = nothing usable produced.
+fn batch_one(args: &Args, song: &ups_core::catalog::Song) -> Result<bool> {
+    let stem = song.media.file_stem().unwrap_or_default()
+        .to_string_lossy().into_owned();
+    let dest = song.dir.join(format!("{stem}.upsong"));
+    let ana_path = song.dir.join(format!("{stem}.analysis.json"));
+
+    // ASR — reuse the stored transcript when it's already a parakeet
+    // pass; needle/empty/missing means re-transcribe
+    let asr_words = read_cached_asr(&ana_path)
+        .filter(|w| w.len() >= 20)
+        .map(|w| {
+            println!("  asr: {} cached words", w.len());
+            w
+        });
+    let asr_words = match asr_words {
+        Some(w) => w,
+        None => {
+            if !asr::have_models(&args.models) {
+                return Ok(false);
+            }
+            let voc = song.dir.join(format!("{stem}.vocals.wav"));
+            let stem_ref = voc.exists().then_some(voc.as_path());
+            let w = asr::transcribe_media(&song.media, stem_ref,
+                                          &args.models)?;
+            println!("  asr: {} words", w.len());
+            if w.len() < 20 {
+                return Ok(false);
+            }
+            // refresh the sidecar so later batch runs reuse these
+            if let Ok(bytes) = std::fs::read(&ana_path) {
+                if let Ok(mut j) =
+                    serde_json::from_slice::<serde_json::Value>(&bytes)
+                {
+                    j["asr"] = serde_json::json!({
+                        "engine": "sherpa-onnx parakeet-tdt-0.6b-v3",
+                        "words": w.len(),
+                        "words_ms": w.iter()
+                            .map(|x| serde_json::json!(
+                                [x.start_ms, x.word]))
+                            .collect::<Vec<_>>(),
+                    });
+                    let _ = std::fs::write(
+                        &ana_path, serde_json::to_string_pretty(&j)
+                            .unwrap_or_default());
+                }
+            }
+            w
+        }
+    };
+
+    // lyrics — best-matching record, same pick as single-song mode
+    let dur = ff::duration(&song.media).ok();
+    let mut recs: Vec<lyrics::LyricRecord> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for (a, t) in lyrics::yt_candidates(&song.artist, &song.title) {
+        if let Some(r) = lyrics::fetch(&a, &t, dur) {
+            if seen.insert(format!("{}|{}", r.artist_name, r.track_name)) {
+                recs.push(r);
+            }
+        }
+    }
+    let q = format!("{} {}", song.artist, song.title);
+    for r in lyrics::search(q.trim(), dur) {
+        if seen.insert(format!("{}|{}", r.artist_name, r.track_name)) {
+            recs.push(r);
+        }
+    }
+    let asr_norm: Vec<(String, f64)> = wordmap::norm_asr(
+        &asr_words.iter()
+            .map(|w| (w.word.clone(), w.start_ms, w.end_ms))
+            .collect::<Vec<_>>());
+    let rec = recs.into_iter()
+        .map(|r| {
+            let lines: Vec<String> = if r.synced.is_empty() {
+                r.plain.clone()
+            } else {
+                r.synced.iter().map(|(_, t)| t.clone()).collect()
+            };
+            let sp = wordmap::map_line_words(&asr_norm, &lines);
+            (sp.values().map(|s| s.words.len()).sum::<usize>(), r)
+        })
+        .max_by_key(|(u, _)| *u)
+        .filter(|(u, _)| *u >= 3)
+        .map(|(_, r)| r);
+    if let Some(r) = &rec {
+        println!("  lyrics: {} synced lines ({} — {})",
+                 r.synced.len(), r.artist_name, r.track_name);
+    }
+
+    Ok(gen_chart(args, &song.media, &song.artist, &song.title,
+                 &asr_words, &dest, rec.as_ref()))
+}
+
+/// Cached transcript from `<stem>.analysis.json` when the ASR engine
+/// is already parakeet — avoids re-transcribing on every batch run.
+fn read_cached_asr(ana_path: &Path) -> Option<Vec<asr::AsrWord>> {
+    let j: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(ana_path).ok()?).ok()?;
+    let engine = j["asr"]["engine"].as_str().unwrap_or("");
+    if !engine.contains("parakeet") {
+        return None;
+    }
+    let words = j["asr"]["words_ms"].as_array()?.iter()
+        .filter_map(|w| {
+            Some(asr::AsrWord {
+                start_ms: w[0].as_f64()?,
+                end_ms: w[0].as_f64()?,
+                word: w[1].as_str()?.to_string(),
+            })
+        }).collect();
+    Some(words)
+}
 fn gen_chart(args: &Args, media: &Path, artist: &str, title: &str,
              asr_words: &[asr::AsrWord], dest: &Path,
-             rec: Option<&lyrics::LyricRecord>) {
+             rec: Option<&lyrics::LyricRecord>) -> bool {
     if asr_words.len() < 20 {
         eprintln!("chart: too few asr words ({}) — need an imported \
                    chart or better audio", asr_words.len());
-        return;
+        return false;
     }
     let asr: Vec<(String, f64)> = wordmap::norm_asr(
         &asr_words.iter()
@@ -427,7 +590,7 @@ fn gen_chart(args: &Args, media: &Path, artist: &str, title: &str,
         Some(chart) => {
             if let Err(e) = ups_core::chart::save_native(&chart, dest) {
                 eprintln!("chart write failed: {e}");
-                return;
+                return false;
             }
             let n: usize =
                 chart.tracks.values().map(|v| v.len()).sum();
@@ -437,8 +600,12 @@ fn gen_chart(args: &Args, media: &Path, artist: &str, title: &str,
                      meta.lrc_shift_ms
                          .map(|s| format!(", lrc shift {s:.0}ms"))
                          .unwrap_or_default());
+            true
         }
-        None => eprintln!("chart: generation produced nothing usable \
-                           — try --chart with an imported file"),
+        None => {
+            eprintln!("chart: generation produced nothing usable \
+                       — try --chart with an imported file");
+            false
+        }
     }
 }
