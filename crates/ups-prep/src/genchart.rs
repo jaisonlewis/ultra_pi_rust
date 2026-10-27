@@ -878,6 +878,7 @@ pub fn generate(artist: &str, title: &str,
         });
     }
     chart.tracks.insert("P1".into(), p1);
+    ups_core::romanize::romanize_chart(&mut chart);
     chart.breaks.insert(
         "P1".into(),
         line_breaks[..line_breaks.len().saturating_sub(1)]

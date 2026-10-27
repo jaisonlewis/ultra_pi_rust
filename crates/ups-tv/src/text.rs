@@ -1,17 +1,23 @@
 //! Bitmap text — fontdue glyph rasterization into a small cache,
 //! alpha-composited onto the u32 framebuffer. Old-school style: no GPU,
 //! no atlas allocator, just blit-and-go.
+//!
+//! Fallback chain: the primary UI font first, then every .ttf/.otf
+//! found in a `fonts/` dir next to the executable (or the fixed
+//! candidates below) — CJK lives there. Per-glyph, the first face
+//! that actually contains the character wins, matching how a browser
+//! falls through font-family.
 
 use std::collections::HashMap;
 
 use fontdue::{Font, FontSettings};
 
 pub struct Text {
-    font: Font,
+    fonts: Vec<Font>,
     cache: HashMap<(char, u32), (Vec<u8>, usize, usize, i32, i32)>,
 }
 
-pub fn find_font() -> Option<Vec<u8>> {
+fn primary_font() -> Option<Vec<u8>> {
     for p in [
         // Windows
         "C:/Windows/Fonts/segoeui.ttf",
@@ -29,9 +35,7 @@ pub fn find_font() -> Option<Vec<u8>> {
     None
 }
 
-/// Bold face for lyrics/score — the web TV renders the lyric line at
-/// weight 700. Falls back to the regular face when no bold is around.
-pub fn find_font_bold() -> Option<Vec<u8>> {
+fn bold_font() -> Option<Vec<u8>> {
     for p in [
         "C:/Windows/Fonts/segoeuib.ttf",
         "C:/Windows/Fonts/arialbd.ttf",
@@ -43,28 +47,99 @@ pub fn find_font_bold() -> Option<Vec<u8>> {
             return Some(bytes);
         }
     }
-    find_font()
+    None
+}
+
+/// Candidate dirs scanned for fallback faces — anything *.ttf/.otf in
+/// them joins the chain sorted by name. Drop Noto CJK etc. into
+/// `fonts/` next to the binary and it renders.
+fn font_dirs() -> Vec<std::path::PathBuf> {
+    let mut dirs = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(d) = exe.parent() {
+            dirs.push(d.join("fonts"));
+            // source checkout layout: <repo>/target/release/ups-app
+            if let Some(repo) = d.parent().and_then(|t| t.parent()).and_then(|t| t.parent()) {
+                dirs.push(repo.join("fonts"));
+            }
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        dirs.push(cwd.join("fonts"));
+    }
+    dirs.push("/home/jaison/ups-rust/fonts".into());
+    dirs.push("/usr/share/fonts/ups".into());
+    dirs
+}
+
+/// (primary, fallbacks) font byte blobs. `bold` picks the 700 face
+/// for the primary; fallbacks are shared — no CJK bold on the Pi,
+/// the regular faces still render.
+fn font_blobs(bold: bool) -> Vec<Vec<u8>> {
+    let mut blobs = Vec::new();
+    if let Some(b) = if bold { bold_font().or_else(primary_font) } else { primary_font() } {
+        blobs.push(b);
+    }
+    let mut extra: Vec<std::path::PathBuf> = Vec::new();
+    for d in font_dirs() {
+        if let Ok(rd) = std::fs::read_dir(&d) {
+            for e in rd.flatten() {
+                let p = e.path();
+                let ext = p.extension()
+                    .and_then(|x| x.to_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+                if ext == "ttf" || ext == "otf" {
+                    extra.push(p);
+                }
+            }
+        }
+    }
+    extra.sort();
+    extra.dedup();
+    for p in extra {
+        if let Ok(b) = std::fs::read(&p) {
+            blobs.push(b);
+        }
+    }
+    blobs
 }
 
 impl Text {
     pub fn new() -> Option<Self> {
-        let bytes = find_font()?;
-        let font = Font::from_bytes(bytes, FontSettings::default()).ok()?;
-        Some(Text { font, cache: HashMap::new() })
+        Self::load(false)
     }
 
     pub fn new_bold() -> Option<Self> {
-        let bytes = find_font_bold()?;
-        let font = Font::from_bytes(bytes, FontSettings::default()).ok()?;
-        Some(Text { font, cache: HashMap::new() })
+        Self::load(true)
+    }
+
+    fn load(bold: bool) -> Option<Self> {
+        let fonts: Vec<Font> = font_blobs(bold)
+            .into_iter()
+            .filter_map(|b| Font::from_bytes(b, FontSettings::default()).ok())
+            .collect();
+        if fonts.is_empty() {
+            return None;
+        }
+        Some(Text { fonts, cache: HashMap::new() })
+    }
+
+    /// First face containing `ch` — index 0 is the primary.
+    fn face_for(&self, ch: char) -> &Font {
+        self.fonts
+            .iter()
+            .find(|f| f.lookup_glyph_index(ch) != 0)
+            .unwrap_or(&self.fonts[0])
     }
 
     /// Rasterize `ch` at `px` (cached); returns (alpha, w, h, xmin, ymin).
     fn glyph(&mut self, ch: char, px: u32) -> &(Vec<u8>, usize, usize, i32, i32) {
-        self.cache.entry((ch, px)).or_insert_with(|| {
-            let (m, bmp) = self.font.rasterize(ch, px as f32);
-            (bmp, m.width, m.height, m.xmin, m.ymin)
-        })
+        if !self.cache.contains_key(&(ch, px)) {
+            let (m, bmp) = self.face_for(ch).rasterize(ch, px as f32);
+            self.cache.insert((ch, px), (bmp, m.width, m.height, m.xmin, m.ymin));
+        }
+        &self.cache[&(ch, px)]
     }
 
     /// Advance width — same integer truncation as draw() so centering
@@ -72,15 +147,14 @@ impl Text {
     pub fn width(&mut self, s: &str, px: u32) -> usize {
         s.chars()
             .map(|c| {
-                self.font.metrics(c, px as f32).advance_width as i32
+                self.face_for(c).metrics(c, px as f32).advance_width as i32
             })
             .sum::<i32>()
             .max(0) as usize
     }
 
     fn baseline(&self, y: i32, px: u32) -> i32 {
-        y + self
-            .font
+        y + self.fonts[0]
             .horizontal_line_metrics(px as f32)
             .map(|m| m.ascent.ceil() as i32)
             .unwrap_or(px as i32)
@@ -132,7 +206,7 @@ impl Text {
         let mut cx = x;
         let baseline = self.baseline(y, px);
         for ch in s.chars() {
-            let adv = self.font.metrics(ch, px as f32).advance_width as i32;
+            let adv = self.face_for(ch).metrics(ch, px as f32).advance_width as i32;
             if ch != ' ' {
                 let (bmp, gw, gh, xmin, ymin) = self.glyph(ch, px).clone();
                 f(cx, baseline, &bmp, gw, gh, xmin, ymin);

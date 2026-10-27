@@ -123,3 +123,24 @@ fn txt_parser_word_breaks() {
     assert_eq!(c.lines("P1").len(), 2);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn romanize_kana_and_cyrillic() {
+    let mut c = demo_chart();
+    c.tracks.get_mut("P1").unwrap()[0].text = "センチメンタルな恋".into();
+    c.tracks.get_mut("P1").unwrap()[1].text = "キラキラ".into();
+    ups_core::romanize::romanize_chart(&mut c);
+    let ns = &c.tracks["P1"];
+    assert_eq!(ns[0].alt, "senchimentaru na koi");
+    assert_eq!(ns[1].alt, "kirakira");
+    assert_eq!(c.headers.get("ALTSCRIPT").map(|s| s.as_str()), Some("romaji"));
+}
+
+#[test]
+fn romanize_script_detection() {
+    assert_eq!(ups_core::romanize::script_of("革命道中"), "zh");
+    assert_eq!(ups_core::romanize::script_of("かな革命"), "jp");
+    assert_eq!(ups_core::romanize::script_of("사랑해"), "kr");
+    assert_eq!(ups_core::romanize::script_of("Москва"), "cyr");
+    assert_eq!(ups_core::romanize::script_of("hello"), "latin");
+}

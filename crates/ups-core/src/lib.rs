@@ -8,6 +8,7 @@ pub mod chart;
 pub mod decode;
 pub mod layout;
 pub mod pitch;
+pub mod romanize;
 pub mod scoring;
 pub mod session;
 
