@@ -381,10 +381,17 @@ impl State {
                         && e.duration_sec == fresh.duration_sec
                         && e.inst == fresh.inst
                         && e.chart == fresh.chart
-                        && e.art == fresh.art;
+                        && e.art == fresh.art
+                        && e.chart_alt == fresh.chart_alt
+                        && e.is_duet == fresh.is_duet
+                        && e.tracks == fresh.tracks;
                     if !same {
                         *e = fresh;
                         r.updated += 1;
+                    } else {
+                        // same entry, new chart mtime — stamp it so the
+                        // 15s tick doesn't re-parse this chart forever
+                        e.chart_mtime = fresh.chart_mtime;
                     }
                 }
                 None => {
