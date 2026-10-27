@@ -7,4 +7,4 @@ pub mod text;
 pub mod video;
 pub mod driver;
 
-pub use driver::{Driver, PlayItem, run};
+pub use driver::{Driver, Exit, PlayItem, run};

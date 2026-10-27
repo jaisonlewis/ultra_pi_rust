@@ -208,8 +208,18 @@ impl Fx {
     }
 }
 
+/// Why the kiosk loop ended — `Quit` means the user pressed Escape
+/// (don't reopen), `Lost` means the compositor took the surface
+/// (screen blanked, wayland hiccup): the caller should respawn it,
+/// killing the whole server over a blanked screen is wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Exit {
+    Quit,
+    Lost,
+}
+
 /// The kiosk loop — blocks until the window closes.
-pub fn run(driver: Arc<dyn Driver>) {
+pub fn run(driver: Arc<dyn Driver>) -> Exit {
     // panics on minifb's internal wayland threads print by default, but
     // a panic on THIS thread while a child thread holds the surface
     // deadlocks — hook logs before unwind regardless of thread
@@ -243,7 +253,10 @@ pub fn run(driver: Arc<dyn Driver>) {
     let mut cur_id: Option<i64> = None;
     let mut idle_fx = Fx::new();
 
-    while window.is_open() && !window.is_key_down(Key::Escape) {
+    while window.is_open() {
+        if window.is_key_down(Key::Escape) {
+            return Exit::Quit;
+        }
         let item = driver.current();
         match (item, cur_id) {
             (None, _) => {
@@ -259,6 +272,7 @@ pub fn run(driver: Arc<dyn Driver>) {
             }
         }
     }
+    Exit::Lost
 }
 
 /// layout scale — all pixel constants are written for 720p and scaled

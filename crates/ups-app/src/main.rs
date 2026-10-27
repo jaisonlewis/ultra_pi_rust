@@ -237,7 +237,24 @@ fn main() {
             std::thread::sleep(std::time::Duration::from_millis(50));
         };
         eprintln!("ups-app: native tv window starting");
-        ups_tv::run(app); // blocks on the kiosk loop (main thread)
+        loop {
+            let drv = app.clone();
+            // catch_unwind: a window-creation panic (no display yet,
+            // wayland restart) must not take the server down with it
+            let r = std::panic::catch_unwind(
+                std::panic::AssertUnwindSafe(move || ups_tv::run(drv)),
+            );
+            match r {
+                Ok(ups_tv::Exit::Quit) => break,
+                Ok(ups_tv::Exit::Lost) => {
+                    eprintln!("ups-app: tv window lost — reopening in 3s")
+                }
+                Err(_) => eprintln!(
+                    "ups-app: tv renderer panicked — retrying in 3s"
+                ),
+            }
+            std::thread::sleep(std::time::Duration::from_secs(3));
+        }
     } else {
         // no renderer — park main thread forever
         loop {

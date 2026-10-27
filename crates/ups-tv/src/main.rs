@@ -80,7 +80,7 @@ fn main() {
         return;
     };
     eprintln!("playing: {} — {}", item.artist, item.title);
-    run(Arc::new(OneShot {
+    let _ = run(Arc::new(OneShot {
         item: std::sync::Mutex::new(Some(item)),
         done: std::sync::Mutex::new(false),
     }));
