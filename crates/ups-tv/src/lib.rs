@@ -5,6 +5,7 @@
 pub mod render;
 pub mod text;
 pub mod video;
+pub mod viz;
 pub mod driver;
 
 pub use driver::{Driver, Exit, PlayItem, run};

@@ -23,6 +23,7 @@ use ups_core::session::Session;
 use crate::render;
 use crate::text::Text;
 use crate::video::VideoPipe;
+use crate::viz;
 
 /// One thing to play — resolved by the driver (queue layer lives
 /// outside this crate).
@@ -545,6 +546,21 @@ fn play_item(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
     // countdown over — collect the preload. PCM decode wins when it
     // succeeded; anything else falls back to the streaming source.
     let (pcm, shm) = preload.join().unwrap_or((None, None));
+    // audio-only songs keep the PCM around — the visualizer FFTs the
+    // same buffer the sink plays, locked to the master clock
+    let viz_pcm: Option<(std::sync::Arc<Vec<f32>>, usize, u32)> =
+        if it.audio_only {
+            pcm.as_ref()
+                .filter(|(s, _, _)| !s.is_empty())
+                .map(|(s, ch, rate)| {
+                    (std::sync::Arc::new(s.clone()),
+                     *ch as usize, *rate)
+                })
+        } else {
+            None
+        };
+    let mut viz = viz_pcm.as_ref().map(|_| viz::Viz::new());
+    let mut viz_fb = viz_pcm.as_ref().map(|_| vec![0u32; fw * fh]);
     let mut staged = staged;
     staged.0 = shm;
     let mut pipe = if !it.audio_only {
@@ -779,6 +795,16 @@ fn play_item(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
         // layout, so the blit is one memcpy, not a 2M-pixel convert
         if pipe.is_some() {
             fb.copy_from_slice(&frame);
+        } else if let (Some(v), Some((pcm, ch, rate)), Some(vfb)) =
+            (viz.as_mut(), viz_pcm.as_ref(), viz_fb.as_mut())
+        {
+            // audio-only: FFT the playhead's PCM window, draw the
+            // kaleidoscope into its own buffer (motion trails must not
+            // smear the lyrics/lane overlaid after), then composite
+            let bands = v.analyze(pcm, *ch, *rate, pos_ms);
+            v.step();
+            viz::draw(vfb, fw, fh, v, &bands);
+            fb.copy_from_slice(vfb);
         } else {
             render::fill(fb, render::BG);
         }
