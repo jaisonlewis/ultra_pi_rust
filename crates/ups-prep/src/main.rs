@@ -15,6 +15,8 @@ mod artwork;
 mod asr;
 mod ff;
 mod genchart;
+#[cfg(feature = "gui")]
+mod gui;
 mod lyrics;
 mod mel;
 mod rmvpe;
@@ -24,6 +26,26 @@ mod wordmap;
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// GUI log tee — when the window is up, every progress line is also
+/// forwarded to its log pane. CLI behavior is unchanged otherwise.
+static LOG_TX: std::sync::Mutex<
+    Option<std::sync::mpsc::Sender<String>>,
+> = std::sync::Mutex::new(None);
+
+pub fn set_log_sink(tx: Option<std::sync::mpsc::Sender<String>>) {
+    *LOG_TX.lock().unwrap() = tx;
+}
+
+macro_rules! say {
+    ($($arg:tt)*) => {{
+        let msg = format!($($arg)*);
+        println!("{msg}");
+        if let Some(tx) = LOG_TX.lock().unwrap().as_ref() {
+            let _ = tx.send(msg);
+        }
+    }};
+}
 
 struct Args {
     source: String,
@@ -36,6 +58,8 @@ struct Args {
     no_separate: bool,
     /// `batch` mode — regenerate charts across a whole library.
     batch: bool,
+    /// open the native window instead of running the CLI pipeline
+    gui: bool,
 }
 
 fn parse_args() -> Result<Args> {
@@ -52,10 +76,12 @@ fn parse_args() -> Result<Args> {
         guide: 0.15,
         no_separate: false,
         batch: false,
+        gui: false,
     };
     while let Some(arg) = a.next() {
         match arg.as_str() {
             "batch" => args.batch = true,
+            "--gui" => args.gui = true,
             "--library" => args.library = a.next().context("--library")?.into(),
             "--models" => args.models = a.next().context("--models")?.into(),
             "--chart" => args.chart = Some(a.next().context("--chart")?.into()),
@@ -75,7 +101,8 @@ fn parse_args() -> Result<Args> {
                      \x20 --title NAME     override title\n\
                      \x20 --guide F        guide-vocal level 0..1 \
                      (default 0.15)\n\
-                     \x20 --no-separate    skip vocal separation\n\n\
+                     \x20 --no-separate    skip vocal separation\n\
+                     \x20 --gui            open the prep window\n\n\
                      batch re-runs ASR + RMVPE + genchart on every song\n\
                      whose .upsong was machine-generated (CREATOR\n\
                      ultrapistar-genchart) or missing; imported charts\n\
@@ -88,14 +115,14 @@ fn parse_args() -> Result<Args> {
             s => args.source = s.to_string(),
         }
     }
-    if !args.batch && args.source.is_empty() {
-        bail!("need a youtube url or media file");
+    if !args.batch && !args.gui && args.source.is_empty() {
+        bail!("need a youtube url or media file (or --gui)");
     }
     Ok(args)
 }
 
 fn stage(label: &str) {
-    println!("==> {label}");
+    say!("==> {label}");
 }
 
 struct MediaInfo {
@@ -174,11 +201,35 @@ fn split_artist_title(channel: &str, yt_title: &str) -> (String, String) {
 }
 
 fn main() -> Result<()> {
+    // bare `ups-prep` (double-click) opens the window when built with
+    // the gui feature; without it the CLI usage error stands
+    if std::env::args().len() == 1 {
+        #[cfg(feature = "gui")]
+        return gui::run();
+        #[cfg(not(feature = "gui"))]
+        {
+            eprintln!("ups-prep: no arguments — see --help");
+            std::process::exit(2);
+        }
+    }
     let args = parse_args()?;
+    #[cfg(feature = "gui")]
+    if args.gui {
+        return gui::run();
+    }
+    #[cfg(not(feature = "gui"))]
+    if args.gui {
+        bail!("--gui needs a build with --features gui");
+    }
     if args.batch {
         return run_batch(&args);
     }
+    prep(&args)
+}
 
+/// The one-song pipeline: fetch → normalize → separate → karaoke →
+/// ASR → lyrics → chart → artwork → sidecar.
+fn prep(args: &Args) -> Result<()> {
     // provisional dir — download first so yt metadata names it
     let dl_dir = std::env::temp_dir().join(format!(
         "ups-prep-{}", std::process::id()));
@@ -191,7 +242,7 @@ fn main() -> Result<()> {
         info.path.file_stem().unwrap_or_default()
             .to_string_lossy().into_owned()
     } else { info.title.clone() };
-    println!("song: {artist} — {title}");
+    say!("song: {artist} — {title}");
 
     // final folder in the library
     let folder = args.library
@@ -209,7 +260,7 @@ fn main() -> Result<()> {
     // phase 0 — loudness
     stage("normalizing loudness");
     if let Err(e) = ff::normalize(&media) {
-        eprintln!("loudnorm skipped: {e}");
+        say!("loudnorm skipped: {e}");
     }
 
     // phase 1 — stems → karaoke track
@@ -230,11 +281,11 @@ fn main() -> Result<()> {
                     stage("normalizing karaoke track");
                     let _ = ff::normalize(&inst);
                 }
-                Err(e) => eprintln!("separation failed: {e}"),
+                Err(e) => say!("separation failed: {e}"),
             }
         }
     } else if !args.no_separate {
-        eprintln!("separation models/binary not found under {} — \
+        say!("separation models/binary not found under {} — \
                    skipping vocal cut", args.models.display());
     }
 
@@ -247,10 +298,10 @@ fn main() -> Result<()> {
         let stem = voc.exists().then_some(voc.as_path());
         match asr::transcribe_media(&media, stem, &args.models) {
             Ok(w) => {
-                println!("asr: {} words", w.len());
+                say!("asr: {} words", w.len());
                 asr_words = w;
             }
-            Err(e) => eprintln!("asr failed: {e}"),
+            Err(e) => say!("asr failed: {e}"),
         }
     }
 
@@ -299,12 +350,12 @@ fn main() -> Result<()> {
         .filter(|(u, _)| *u >= 3)
         .map(|(_, r)| r);
     if let Some(r) = &rec {
-        println!("lyrics: {} synced / {} plain lines \
+        say!("lyrics: {} synced / {} plain lines \
                   ({} — {})",
                  r.synced.len(), r.plain.len(),
                  r.artist_name, r.track_name);
     } else {
-        println!("lyrics: none found");
+        say!("lyrics: none found");
     }
 
     // phase 2 — chart: import + chroma-align to THIS media, then bake
@@ -319,23 +370,23 @@ fn main() -> Result<()> {
                 Ok(Some(res)) => {
                     let baked = align::bake(&chart, &res);
                     ups_core::chart::save_native(&baked, &dest)?;
-                    println!("chart: aligned off {}ms tempo {} \
+                    say!("chart: aligned off {}ms tempo {} \
                               (matched {}/{} phrases, peak {})",
                              res.offset_ms, res.tempo,
                              res.matched, res.phrases, res.peak);
                 }
                 Ok(None) => {
-                    eprintln!("align: no confident match — importing \
+                    say!("align: no confident match — importing \
                                unaligned (check timing)");
                     ups_core::chart::save_native(&chart, &dest)?;
                 }
-                Err(e) => eprintln!("align failed: {e}"),
+                Err(e) => say!("align failed: {e}"),
             }
         } else {
             ups_core::chart::save_native(&chart, &dest)?;
         }
         let n: usize = chart.tracks.values().map(|v| v.len()).sum();
-        println!("chart: {n} notes → {}", dest.display());
+        say!("chart: {n} notes → {}", dest.display());
     } else {
         gen_chart(&args, &media, &artist, &title, &asr_words,
                   &stem_path("upsong"), rec.as_ref());
@@ -347,8 +398,8 @@ fn main() -> Result<()> {
         match artwork::save(&artist, &title, &art,
                             info.thumb_url.as_deref(),
                             Some(media.as_path())) {
-            Ok(true) => println!("artwork: {}", art.display()),
-            _ => eprintln!("artwork: none"),
+            Ok(true) => say!("artwork: {}", art.display()),
+            _ => say!("artwork: none"),
         }
     }
 
@@ -377,7 +428,7 @@ fn main() -> Result<()> {
                    serde_json::to_string_pretty(&ana)?)?;
 
     let _ = std::fs::remove_dir_all(&dl_dir);
-    println!("done → {}", folder.display());
+    say!("done → {}", folder.display());
     Ok(())
 }
 
@@ -404,18 +455,18 @@ fn run_batch(args: &Args) -> Result<()> {
             skipped += 1;
             continue;
         }
-        println!("[{}/{}] {} — {}", i + 1, total,
+        say!("[{}/{}] {} — {}", i + 1, total,
                  song.artist, song.title);
         match batch_one(args, song) {
             Ok(true) => redone += 1,
             Ok(false) => skipped += 1,
             Err(e) => {
-                eprintln!("  failed: {e}");
+                say!("  failed: {e}");
                 failed += 1;
             }
         }
     }
-    println!("batch done: {redone} regenerated, {skipped} skipped, \
+    say!("batch done: {redone} regenerated, {skipped} skipped, \
               {failed} failed");
     Ok(())
 }
@@ -460,7 +511,7 @@ fn batch_one(args: &Args, song: &ups_core::catalog::Song) -> Result<bool> {
     let asr_words = read_cached_asr(&ana_path)
         .filter(|w| w.len() >= 20)
         .map(|w| {
-            println!("  asr: {} cached words", w.len());
+            say!("  asr: {} cached words", w.len());
             w
         });
     let asr_words = match asr_words {
@@ -473,7 +524,7 @@ fn batch_one(args: &Args, song: &ups_core::catalog::Song) -> Result<bool> {
             let stem_ref = voc.exists().then_some(voc.as_path());
             let w = asr::transcribe_media(&song.media, stem_ref,
                                           &args.models)?;
-            println!("  asr: {} words", w.len());
+            say!("  asr: {} words", w.len());
             if w.len() < 20 {
                 return Ok(false);
             }
@@ -534,7 +585,7 @@ fn batch_one(args: &Args, song: &ups_core::catalog::Song) -> Result<bool> {
         .filter(|(u, _)| *u >= 3)
         .map(|(_, r)| r);
     if let Some(r) = &rec {
-        println!("  lyrics: {} synced lines ({} — {})",
+        say!("  lyrics: {} synced lines ({} — {})",
                  r.synced.len(), r.artist_name, r.track_name);
     }
 
@@ -565,7 +616,7 @@ fn gen_chart(args: &Args, media: &Path, artist: &str, title: &str,
              asr_words: &[asr::AsrWord], dest: &Path,
              rec: Option<&lyrics::LyricRecord>) -> bool {
     if asr_words.len() < 20 {
-        eprintln!("chart: too few asr words ({}) — need an imported \
+        say!("chart: too few asr words ({}) — need an imported \
                    chart or better audio", asr_words.len());
         return false;
     }
@@ -586,17 +637,17 @@ fn gen_chart(args: &Args, media: &Path, artist: &str, title: &str,
         };
         audio16.and_then(|a| {
             rmvpe::extract_curve(&a, &args.models)
-                .map_err(|e| eprintln!("rmvpe failed: {e}")).ok()
+                .map_err(|e| say!("rmvpe failed: {e}")).ok()
                 .inspect(|c| {
                     let voiced = c.f0.iter().zip(&c.conf)
                         .filter(|(f, cf)| **f > 0.0 && **cf >= 0.3)
                         .count();
-                    println!("rmvpe: {} frames, {} voiced",
+                    say!("rmvpe: {} frames, {} voiced",
                              c.times.len(), voiced);
                 })
         })
     } else {
-        eprintln!("rmvpe.onnx not under {} — chart words get no pitch \
+        say!("rmvpe.onnx not under {} — chart words get no pitch \
                    (all freestyle)", args.models.display());
         None
     };
@@ -617,12 +668,12 @@ fn gen_chart(args: &Args, media: &Path, artist: &str, title: &str,
                              curve.as_ref(), &mut meta) {
         Some(chart) => {
             if let Err(e) = ups_core::chart::save_native(&chart, dest) {
-                eprintln!("chart write failed: {e}");
+                say!("chart write failed: {e}");
                 return false;
             }
             let n: usize =
                 chart.tracks.values().map(|v| v.len()).sum();
-            println!("chart: generated {n} notes over {} lines \
+            say!("chart: generated {n} notes over {} lines \
                       ({:?} lyrics, {} asr words{})",
                      meta.lines, meta.lyrics_kind, meta.asr_words,
                      meta.lrc_shift_ms
@@ -631,7 +682,7 @@ fn gen_chart(args: &Args, media: &Path, artist: &str, title: &str,
             true
         }
         None => {
-            eprintln!("chart: generation produced nothing usable \
+            say!("chart: generation produced nothing usable \
                        — try --chart with an imported file");
             false
         }

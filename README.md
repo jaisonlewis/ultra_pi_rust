@@ -80,6 +80,18 @@ ups-prep batch --library <root>   re-chart a whole library: walks
   every song, regenerates .upsongs that were machine-generated
   (or missing), and leaves imported/human charts untouched.
   A stored parakeet transcript is reused so repeats are fast.
+
+ups-prep --gui                    native window form (song URL/file,
+                                  library + models pickers, batch
+                                  button, live log) — needs a build
+                                  with --features gui
+```
+
+GUI build (Windows/Mac/Linux desktop — not needed on the Pi):
+
+```
+cargo build --release -p ups-prep --features gui
+# then: ups-prep --gui, or double-click the exe (no args = window)
 ```
 
 Produces `Library/Artist - Title/<media>` + `.inst.mp4` + `.vocals.wav`

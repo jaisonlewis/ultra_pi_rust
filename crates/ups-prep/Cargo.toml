@@ -4,6 +4,12 @@ description = "Song prep station — download/normalize/separate/chart a song in
 edition.workspace = true
 license.workspace = true
 
+[features]
+# `cargo build --release -p ups-prep --features gui` adds a native
+# window (egui + file pickers) for the same pipeline — double-click
+# friendly. Off by default so headless/Pi builds stay lean.
+gui = ["dep:eframe", "dep:rfd"]
+
 [dependencies]
 ups-core = { path = "../ups-core" }
 serde = { version = "1", features = ["derive"] }
@@ -14,3 +20,6 @@ anyhow = "1"
 ort = "2.0.0-rc.15"
 unicode-normalization = "0.1"
 unicode_categories = "0.1"
+eframe = { version = "0.32", optional = true, default-features = false,
+           features = ["default_fonts", "glow", "wayland", "x11"] }
+rfd = { version = "0.15", optional = true }
