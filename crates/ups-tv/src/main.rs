@@ -65,6 +65,7 @@ fn resolve(args: &[String]) -> Option<PlayItem> {
         audio_only,
         singer: "you".into(),
         tracks: vec!["P1".into()],
+        sync_offset: 0.0,
     })
 }
 

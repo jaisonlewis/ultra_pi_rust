@@ -42,6 +42,8 @@ pub struct PlayItem {
     /// score-attributed singers for the HUD
     pub singer: String,
     pub tracks: Vec<String>,
+    /// persisted chart->media nudge for this entry (0 when untouched)
+    pub sync_offset: f64,
 }
 
 pub trait Driver: Send + Sync {
@@ -63,6 +65,22 @@ pub trait Driver: Send + Sync {
     fn play_at(&self) -> f64 {
         0.0
     }
+    /// The app-level pitch autosync toggle (POST /playback/autosync).
+    fn autosync_enabled(&self) -> bool {
+        false
+    }
+    /// A host nudge landed — apply this absolute offset to the live
+    /// session (drains the mailbox; None = nothing pending).
+    fn take_sync_override(&self) -> Option<f64> {
+        None
+    }
+    /// A manual resync was requested (POST /playback/resync).
+    fn take_resync_request(&self) -> bool {
+        false
+    }
+    /// The solver locked a new offset — persist it against the entry
+    /// and refresh phone-side lyrics.
+    fn sync_offset_applied(&self, _off: f64) {}
     /// "Scan to join" QR payload for the idle screen (data URI or "").
     fn idle_info(&self) -> (String, String) {
         (String::new(), String::new())
@@ -370,9 +388,11 @@ fn play_item(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
     } else {
         it.tracks.clone()
     };
-    let mut sess = chart
-        .clone()
-        .map(|c| Session::new(c, &tracks, 1, true));
+    let mut sess = chart.clone().map(|c| {
+        let mut s = Session::new(c, &tracks, 1, true);
+        s.set_sync_offset(it.sync_offset);
+        s
+    });
     let phrases = chart
         .as_ref()
         .and_then(|c| c.phrases().get(&tracks[0]).cloned())
@@ -385,7 +405,10 @@ fn play_item(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
         .as_ref()
         .map(|c| if c.bpm() > 0.0 { 15000.0 / c.bpm() } else { 0.0 })
         .unwrap_or(0.0);
-    let gap_ms = chart.as_ref().map(|c| c.gap_ms()).unwrap_or(0.0);
+    let mut gap_ms = chart
+        .as_ref()
+        .map(|c| c.gap_ms() + it.sync_offset)
+        .unwrap_or(0.0);
 
     let mic = MicCapture::open();
     let mic_tone = mic.as_ref().map(|m| Arc::clone(&m.tone));
@@ -523,6 +546,19 @@ fn play_item(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
             }
         }
 
+        // host sync nudges / manual resync ride in through the driver
+        if let Some(off) = driver.take_sync_override() {
+            if let Some(s) = &mut sess {
+                s.set_sync_offset(off);
+                gap_ms = s.base_ms;
+            }
+        }
+        if driver.take_resync_request() {
+            if let Some(s) = &mut sess {
+                s.request_resync(pos_ms);
+            }
+        }
+
         // scoring tick ~ every 50ms (position events, like tv.js)
         if pos_ms as u64 / 50 != last_tick {
             last_tick = pos_ms as u64 / 50;
@@ -535,6 +571,16 @@ fn play_item(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
                     tones.insert(tr.clone(), tone);
                 }
                 let r = s.tick(pos_ms, &tones);
+                if driver.autosync_enabled() {
+                    if let Some(a) = s.maybe_autosync(pos_ms) {
+                        if let Some(off) = a["offset_ms"].as_f64() {
+                            s.set_sync_offset(off);
+                            gap_ms = s.base_ms;
+                            driver.sync_offset_applied(off);
+                        }
+                        driver.emit("sing:autosync", &a);
+                    }
+                }
                 let now_f32 = song_start.elapsed().as_secs_f32();
                 if r.last_hit.as_ref().and_then(|h| h.hit) == Some(true) {
                     hit_flash_until =
@@ -635,11 +681,17 @@ fn play_item(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
                 fb, fw, fh, &notes, gap_ms, beat_ms, pos_ms, lane_y,
                 lane_h, 6000.0, sung, Instant::now() < hit_flash_until,
             );
-            let log = sess
+            let log: Vec<(f64, i64)> = sess
                 .as_ref()
-                .map(|s| s.tone_log.as_slice())
-                .unwrap_or(&[]);
-            render::draw_trail(fb, fw, fh, log, pos_ms, lane_y,
+                .map(|s| {
+                    s.tone_log
+                        .values()
+                        .flatten()
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            render::draw_trail(fb, fw, fh, &log, pos_ms, lane_y,
                                lane_h, 6000.0);
         }
 

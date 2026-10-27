@@ -1,7 +1,9 @@
 //! axum HTTP layer — port of web/pages.py + web/api.py. Serves the
 //! vendored frontend verbatim; REST shapes match what phone.js/host.js
-//! consume. Pipeline-dependent endpoints (uploads, remote providers,
-//! repair) return compatible stubs until the pipeline lands.
+//! consume. Where Python's sqlite-backed features map onto the
+//! file-based catalog (manage songs, chart verification, uploads,
+//! sync offsets), the response rows keep the same field names so the
+//! frontend can't tell the difference.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -855,6 +857,41 @@ struct SyncBody {
     delta_ms: Option<i64>,
 }
 
+/// lyrics payload for the entry now playing, honoring stored sync +
+/// rom flags — re-sent on every sync nudge so the TV swaps lyrics
+/// without restarting the media.
+fn lyrics_payload_for(app: &App, item: &crate::state::QueueItem,
+                     entry_id: i64) -> Option<Value> {
+    let (chart_path, rom, off) = {
+        let entries = app.st.entries.read().unwrap();
+        let e = entries.iter().find(|e| e.id == entry_id)?;
+        (
+            e.chart.clone()?,
+            item.lyrics_rom.map(|v| v != 0).unwrap_or(false),
+            app.st.sync_offset(e.id),
+        )
+    };
+    let c = ups_core::chart::load_chart(&chart_path);
+    Some(ups_core::chart::lane_payload(&c, rom, off, &[]))
+}
+
+/// GET /api/playback/sync — current offset for the playing chart;
+/// any client may read (the host UI polls it when lyrics appear).
+async fn api_pb_sync_get(AxState(app): AxState<Arc<App>>)
+    -> impl IntoResponse {
+    let off = app
+        .st
+        .now_playing()
+        .map(|it| app.st.sync_offset(it.entry_id));
+    Json(json!({
+        "sync_offset_ms": off,
+        "autosync_mic": *app.st.autosync_mic.lock().unwrap(),
+    }))
+}
+
+/// POST /api/playback/sync — delta_ms is a relative nudge onto the
+/// entry's stored offset (chart row's sync_offset_ms in Python),
+/// persisted across restarts and pushed live to session + TV.
 async fn api_pb_sync(AxState(app): AxState<Arc<App>>, headers: HeaderMap,
                      Json(body): Json<SyncBody>)
     -> impl IntoResponse {
@@ -866,17 +903,97 @@ async fn api_pb_sync(AxState(app): AxState<Arc<App>>, headers: HeaderMap,
         )
             .into_response();
     }
-    let delta = body.delta_ms.unwrap_or(0) as f64;
-    let mut slot = app.sing.lock().unwrap();
-    let Some(sing) = slot.as_mut() else {
+    let Some(item) = app.st.now_playing() else {
         return (
             StatusCode::CONFLICT,
             Json(json!({"error": "nothing playing"})),
         )
             .into_response();
     };
-    sing.session.set_sync_offset(delta);
-    Json(json!({"ok": true, "sync_offset_ms": delta as i64})).into_response()
+    let has_chart = {
+        let entries = app.st.entries.read().unwrap();
+        entries
+            .iter()
+            .find(|e| e.id == item.entry_id)
+            .map(|e| e.chart.is_some())
+            .unwrap_or(false)
+    };
+    if !has_chart {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "no verified chart on this song"})),
+        )
+            .into_response();
+    }
+    let delta = body.delta_ms.unwrap_or(0) as f64;
+    let new_off = app.st.sync_offset(item.entry_id) + delta;
+    app.st.set_sync_offset(item.entry_id, new_off);
+    if let Some(sing) = app.sing.lock().unwrap().as_mut() {
+        sing.session.set_sync_offset(new_off);
+    }
+    // native-TV session rides the same absolute offset
+    if app.native_tv {
+        *app.sync_override.lock().unwrap() = Some(new_off);
+    }
+    if let Some(lyr) = lyrics_payload_for(&app, &item, item.entry_id) {
+        let _ = app.io.emit("lyrics", &lyr).await;
+    }
+    Json(json!({"ok": true, "sync_offset_ms": new_off as i64}))
+        .into_response()
+}
+
+/// POST /api/playback/resync — drop prior sync state and collect ~10s
+/// of fresh room audio before re-solving (host or current singer).
+async fn api_pb_resync(AxState(app): AxState<Arc<App>>,
+                       headers: HeaderMap)
+    -> impl IntoResponse {
+    let (sid, _) = ensure_sid(&app, &headers);
+    if !is_host(&app, &headers, &sid) && !is_singer(&app, &sid) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "host or current singer required"})),
+        )
+            .into_response();
+    }
+    {
+        let mut slot = app.sing.lock().unwrap();
+        if let Some(sing) = slot.as_mut() {
+            sing.session.request_resync(sing.last_ms);
+            return Json(json!({"ok": true,
+                "collect_sec": ups_core::session::RESYNC_COLLECT_MS / 1000.0}))
+                .into_response();
+        }
+    }
+    // native-TV mode owns its session — flag the driver loop
+    if app.native_tv && app.st.now_playing().is_some() {
+        app.resync_req
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        return Json(json!({"ok": true,
+                "collect_sec": ups_core::session::RESYNC_COLLECT_MS / 1000.0}))
+            .into_response();
+    }
+    (
+        StatusCode::CONFLICT,
+        Json(json!({"error": "no scored song playing"})),
+    )
+        .into_response()
+}
+
+/// POST /api/playback/autosync — toggle the pitch-solve autosync.
+async fn api_pb_autosync(AxState(app): AxState<Arc<App>>,
+                         headers: HeaderMap, Json(body): Json<Value>)
+    -> impl IntoResponse {
+    let (sid, _) = ensure_sid(&app, &headers);
+    if !is_host(&app, &headers, &sid) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "host key required"})),
+        )
+            .into_response();
+    }
+    let en = body["enabled"].as_bool().unwrap_or(true);
+    app.st.set_autosync_mic(en);
+    Json(json!({"autosync_mic": en})).into_response()
 }
 
 // -- mic/audio ----------------------------------------------------------------
@@ -967,13 +1084,647 @@ async fn api_audio(AxState(app): AxState<Arc<App>>) -> impl IntoResponse {
             "muted": *m.muted.lock().unwrap(),
         })
     });
+    let outputs = if crate::audio::available() {
+        crate::audio::playback_targets()
+    } else {
+        Vec::new()
+    };
     Json(json!({
-        "outputs": [], "mics": [],
+        "outputs": outputs, "mics": [],
         "performers": app.st.performers.lock().unwrap().iter()
             .map(|p| json!({"id": p.id, "name": p.name, "color": p.color}))
             .collect::<Vec<_>>(),
         "monitor": monitor,
     }))
+}
+
+/// POST /api/audio/output — route all audio (music + mic monitor) to a
+/// sink or enable a card. Body: {sink} | {sink_name} | {card}.
+async fn api_audio_output(AxState(app): AxState<Arc<App>>,
+                          headers: HeaderMap, Json(body): Json<Value>)
+    -> impl IntoResponse {
+    let (sid, _) = ensure_sid(&app, &headers);
+    if !is_host(&app, &headers, &sid) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "host key required"})),
+        )
+            .into_response();
+    }
+    let res = if let Some(v) = body.get("sink") {
+        crate::audio::select_output("sink", v)
+    } else if let Some(v) = body.get("sink_name") {
+        crate::audio::select_output("sink_name", v)
+    } else if let Some(v) = body.get("card") {
+        crate::audio::select_output("card", v)
+    } else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "sink or card required"})),
+        )
+            .into_response();
+    };
+    if res["ok"].as_bool().unwrap_or(false) {
+        // persist the stable node name — wpctl ids churn across restarts
+        let saved = if res["node"].as_str().map(|s| !s.is_empty())
+            .unwrap_or(false)
+        {
+            json!({"sink_name": res["node"]})
+        } else if body.get("card").is_some() {
+            json!({"card": body["card"]})
+        } else {
+            Value::Null
+        };
+        if !saved.is_null() {
+            *app.st.output_target.lock().unwrap() =
+                Some(saved.to_string());
+            app.st.persist();
+        }
+    }
+    if res["ok"].as_bool().unwrap_or(false) {
+        Json(res).into_response()
+    } else {
+        (StatusCode::BAD_GATEWAY, Json(res)).into_response()
+    }
+}
+
+// -- song/version management (host) ------------------------------------------
+
+/// GET /api/manage/songs — every song + its media versions and
+/// queue/chart state, for the phone Songs tab.
+async fn api_manage_songs(AxState(app): AxState<Arc<App>>)
+    -> impl IntoResponse {
+    let entries = app.st.entries.read().unwrap().clone();
+    let q = app.st.queue.lock().unwrap();
+    let rows: Vec<Value> = entries
+        .iter()
+        .map(|e| {
+            let dir = e.media.parent().map(|p| p.to_path_buf())
+                .unwrap_or_else(|| app.st.root.clone());
+            let stem = e.media.file_stem()
+                .unwrap_or_default().to_string_lossy().to_string();
+            let size = std::fs::metadata(&e.media)
+                .map(|m| m.len()).unwrap_or(0);
+            let has_stem =
+                dir.join(format!("{stem}.vocals.wav")).is_file();
+            let queued = q.iter()
+                .filter(|i| i.entry_id == e.id && i.status == "queued")
+                .count();
+            let playing = q.iter()
+                .filter(|i| i.entry_id == e.id && i.status == "playing")
+                .count();
+            let chart_source = e.chart.as_ref().and_then(|p| {
+                let c = ups_core::chart::load_chart(p);
+                c.headers.get("CREATOR").map(|v| {
+                    if v.contains("genchart") {
+                        "generated".to_string()
+                    } else {
+                        v.clone()
+                    }
+                })
+            });
+            json!({
+                "song_id": e.song_id, "artist": e.artist,
+                "title": e.title, "is_duet": e.is_duet,
+                "entry_id": e.id, "provider": e.provider,
+                "source_id": e.source_id, "status": "available",
+                "duration_sec": e.duration_sec,
+                "local_path": e.media.file_name()
+                    .unwrap_or_default().to_string_lossy(),
+                "thumbnail": if e.art.is_some() {
+                    json!(format!("/api/art/{}.jpg", e.id))
+                } else { Value::Null },
+                "inst_path": e.inst.as_ref().map(|_| "x"),
+                "scored": e.chart.is_some() as i64,
+                "chart_source": chart_source,
+                "possible_chart": false,
+                "playing": playing, "queued": queued,
+                "size_bytes": size, "has_stem": has_stem,
+                "has_inst": e.inst.is_some(), "processing": false,
+            })
+        })
+        .collect();
+    Json(json!({"songs": rows}))
+}
+
+/// The disk files backing an entry — media + derived sidecars.
+fn entry_files(e: &crate::state::Entry) -> Vec<PathBuf> {
+    let mut out = vec![e.media.clone()];
+    if let Some(p) = &e.inst {
+        out.push(p.clone());
+    }
+    if let Some(p) = &e.chart {
+        out.push(p.clone());
+    }
+    if let Some(p) = &e.art {
+        out.push(p.clone());
+    }
+    let stem = e.media.file_stem().unwrap_or_default().to_string_lossy();
+    let dir = e.media.parent().map(|p| p.to_path_buf())
+        .unwrap_or_default();
+    for suffix in [".vocals.wav", ".analysis.json", ".lrc", ".txt"] {
+        out.push(dir.join(format!("{stem}{suffix}")));
+    }
+    out
+}
+
+/// Remove an entry's queued items, catalog row, and files. Caller has
+/// already guarded the playing case.
+fn delete_entry(app: &App, entry_id: i64) {
+    let (dir, song_id) = {
+        let mut entries = app.st.entries.write().unwrap();
+        let Some(e) = entries.iter().find(|e| e.id == entry_id).cloned()
+        else {
+            return;
+        };
+        let dir = e.media.parent().map(|p| p.to_path_buf());
+        for f in entry_files(&e) {
+            let _ = std::fs::remove_file(f);
+        }
+        let sid = e.song_id;
+        entries.retain(|e| e.id != entry_id);
+        (dir, sid)
+    };
+    {
+        let mut q = app.st.queue.lock().unwrap();
+        q.retain(|i| i.entry_id != entry_id || i.status != "queued");
+    }
+    // one-song-per-folder layouts leave an empty dir behind
+    if let Some(d) = dir {
+        let _ = std::fs::remove_dir(&d);
+    }
+    let _ = song_id;
+    app.st.persist();
+}
+
+/// POST /api/manage/entry/<id>/delete — remove one media version.
+async fn api_manage_entry_delete(
+    AxState(app): AxState<Arc<App>>, headers: HeaderMap,
+    Path(entry_id): Path<i64>)
+    -> impl IntoResponse {
+    let (sid, _) = ensure_sid(&app, &headers);
+    if !is_host(&app, &headers, &sid) {
+        return (StatusCode::FORBIDDEN,
+                Json(json!({"error": "host key required"})))
+            .into_response();
+    }
+    {
+        let entries = app.st.entries.read().unwrap();
+        if !entries.iter().any(|e| e.id == entry_id) {
+            return (StatusCode::NOT_FOUND,
+                    Json(json!({"error": "not found"})))
+                .into_response();
+        }
+    }
+    if app.st.now_playing().map(|i| i.entry_id) == Some(entry_id) {
+        return (StatusCode::CONFLICT,
+                Json(json!({"error": "can't delete — this song is playing"})))
+            .into_response();
+    }
+    delete_entry(&app, entry_id);
+    let _ = app.io.emit("state", &app.st.snapshot()).await;
+    Json(json!({"ok": true})).into_response()
+}
+
+/// POST /api/manage/song/<id>/delete — remove all versions of a song.
+/// (File-based catalog: song_id == entry_id here.)
+async fn api_manage_song_delete(
+    AxState(app): AxState<Arc<App>>, headers: HeaderMap,
+    Path(song_id): Path<i64>)
+    -> impl IntoResponse {
+    api_manage_entry_delete(AxState(app), headers, Path(song_id))
+        .await
+        .into_response()
+}
+
+/// POST /api/manage/entry/<id>/repair — re-derive this version's
+/// sidecars. With an `ups-prep` binary alongside us (or on PATH) the
+/// full pipeline runs on the media file in the background; otherwise
+/// a targeted rescan refreshes whatever files appeared by hand.
+async fn api_manage_entry_repair(
+    AxState(app): AxState<Arc<App>>, headers: HeaderMap,
+    Path(entry_id): Path<i64>)
+    -> impl IntoResponse {
+    let (sid, _) = ensure_sid(&app, &headers);
+    if !is_host(&app, &headers, &sid) {
+        return (StatusCode::FORBIDDEN,
+                Json(json!({"error": "host key required"})))
+            .into_response();
+    }
+    let media = {
+        let entries = app.st.entries.read().unwrap();
+        entries.iter().find(|e| e.id == entry_id).map(|e| e.media.clone())
+    };
+    let Some(media) = media else {
+        return (StatusCode::NOT_FOUND,
+                Json(json!({"error": "not found"})))
+            .into_response();
+    };
+    let prep = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| {
+            d.join(if cfg!(windows) { "ups-prep.exe" } else { "ups-prep" })
+        }))
+        .filter(|p| p.is_file())
+        .or_else(|| {
+            std::process::Command::new(
+                if cfg!(windows) { "ups-prep.exe" } else { "ups-prep" })
+                .arg("--version")
+                .output()
+                .ok()
+                .map(|_| PathBuf::from("ups-prep"))
+        });
+    if let Some(bin) = prep {
+        let root = app.st.root.clone();
+        std::thread::spawn(move || {
+            let _ = std::process::Command::new(bin)
+                .arg(&media)
+                .arg("--library")
+                .arg(&root)
+                .status();
+        });
+        Json(json!({"ok": true, "regenerating": true})).into_response()
+    } else {
+        let _ = app.st.rescan();
+        let _ = app.io.emit("state", &app.st.snapshot()).await;
+        Json(json!({"ok": true, "regenerating": false})).into_response()
+    }
+}
+
+// -- chart library (host) -----------------------------------------------------
+
+/// Normalize for chart<->song matching (Python's normalized
+/// artist+title key): lowercase alphanumeric.
+fn norm_key(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
+/// .txt chart files under chart-library/ + charts/ — the unverified
+/// drops Python's chart_library table tracks. id is a stable hash of
+/// the path so /verify can find it again.
+fn pending_charts(app: &App) -> Vec<Value> {
+    fn walk(dir: &PathBuf, out: &mut Vec<PathBuf>, depth: u32) {
+        if depth > 4 || !dir.is_dir() {
+            return;
+        }
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, out, depth + 1);
+                } else if p.extension()
+                    .map(|x| x == "txt")
+                    .unwrap_or(false)
+                {
+                    out.push(p);
+                }
+            }
+        }
+    }
+    let mut files = Vec::new();
+    for d in ["chart-library", "charts"] {
+        walk(&app.st.root.join(d), &mut files, 0);
+    }
+    let entries = app.st.entries.read().unwrap().clone();
+    files
+        .into_iter()
+        .map(|p| {
+            let c = ups_core::chart::load_chart(&p);
+            let (artist, title) = if !c.artist().is_empty() {
+                (c.artist().to_string(), c.title().to_string())
+            } else {
+                let stem = p.file_stem()
+                    .unwrap_or_default().to_string_lossy().to_string();
+                crate::state::split_artist_title(&stem)
+            };
+            let m = entries.iter().find(|e| {
+                norm_key(&e.artist) == norm_key(&artist)
+                    && norm_key(&e.title) == norm_key(&title)
+            });
+            let id = {
+                use std::collections::hash_map::DefaultHasher;
+                use std::hash::{Hash, Hasher};
+                let mut h = DefaultHasher::new();
+                p.hash(&mut h);
+                h.finish() as i64
+            };
+            json!({
+                "id": id,
+                "artist": artist, "title": title,
+                "file_path": p.display().to_string(),
+                "source_repo": c.headers.get("SOURCE")
+                    .cloned().unwrap_or_else(|| "local".to_string()),
+                "is_duet": c.is_duet(),
+                "media_entry_id": m.map(|e| e.id),
+            })
+        })
+        .collect()
+}
+
+async fn api_pending_charts(AxState(app): AxState<Arc<App>>,
+                            headers: HeaderMap)
+    -> impl IntoResponse {
+    let (sid, _) = ensure_sid(&app, &headers);
+    if !is_host(&app, &headers, &sid) {
+        return (StatusCode::FORBIDDEN,
+                Json(json!({"error": "host key required"})))
+            .into_response();
+    }
+    Json(json!({"charts": pending_charts(&app)})).into_response()
+}
+
+/// POST /api/catalog/chart/<id>/verify — promote a chart-library .txt
+/// to the entry's canonical .upsong sidecar (import + native save).
+async fn api_chart_verify(AxState(app): AxState<Arc<App>>,
+                          headers: HeaderMap, Path(chart_id): Path<i64>,
+                          Json(body): Json<Value>)
+    -> impl IntoResponse {
+    let (sid, _) = ensure_sid(&app, &headers);
+    if !is_host(&app, &headers, &sid) {
+        return (StatusCode::FORBIDDEN,
+                Json(json!({"error": "host key required"})))
+            .into_response();
+    }
+    let pending = pending_charts(&app);
+    let Some(row) = pending.iter()
+        .find(|c| c["id"].as_i64() == Some(chart_id)).cloned()
+    else {
+        return (StatusCode::NOT_FOUND,
+                Json(json!({"error": "chart not found"})))
+            .into_response();
+    };
+    let entry_id = body["media_entry_id"].as_i64()
+        .or_else(|| row["media_entry_id"].as_i64());
+    let Some(entry_id) = entry_id else {
+        return (StatusCode::BAD_REQUEST,
+                Json(json!({"error": "no media entry for this song"})))
+            .into_response();
+    };
+    let media = {
+        let entries = app.st.entries.read().unwrap();
+        entries.iter().find(|e| e.id == entry_id).map(|e| e.media.clone())
+    };
+    let Some(media) = media else {
+        return (StatusCode::NOT_FOUND,
+                Json(json!({"error": "media entry not found"})))
+            .into_response();
+    };
+    let c = ups_core::chart::load_chart(
+        &PathBuf::from(row["file_path"].as_str().unwrap_or_default()));
+    let dest = media.with_extension("upsong");
+    if ups_core::chart::save_native(&c, &dest).is_err() {
+        return (StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "could not write .upsong"})))
+            .into_response();
+    }
+    let _ = app.st.rescan();
+    let _ = app.io.emit("state", &app.st.snapshot()).await;
+    Json(json!({"ok": true})).into_response()
+}
+
+// -- upload + playlist --------------------------------------------------------
+
+const UPLOAD_EXTS: &[&str] =
+    &["mp3", "m4a", "ogg", "wav", "flac", "mp4", "webm", "mkv"];
+const UPLOAD_MAX_BYTES: usize = 400 * 1024 * 1024;
+
+fn sanitize_stem(s: &str) -> String {
+    let out: String = s
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || " -_()[]&".contains(c) {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let out = out.trim_matches(|c| c == '_' || c == ' ');
+    if out.is_empty() { "song".to_string() } else { out.to_string() }
+}
+
+/// POST /api/upload — multipart {file, artist?, title?}. Saves under
+/// the media root as upload-<ts>-<stem>.<ext>, then the normal rescan
+/// picks it up. Returns the new entry's search-row shape for the
+/// phone's queue-confirm sheet.
+async fn api_upload(AxState(app): AxState<Arc<App>>,
+                    mut mp: axum::extract::Multipart)
+    -> impl IntoResponse {
+    let mut file: Option<(String, Vec<u8>)> = None;
+    let (mut artist, mut title) = (String::new(), String::new());
+    while let Ok(Some(field)) = mp.next_field().await {
+        let name = field.name().unwrap_or("").to_string();
+        if name == "file" {
+            let fname = field.file_name().unwrap_or("").to_string();
+            match field.bytes().await {
+                Ok(b) => file = Some((fname, b.to_vec())),
+                Err(_) => {
+                    return (StatusCode::PAYLOAD_TOO_LARGE,
+                            Json(json!({"error": "file too large (400 MB max)"})))
+                        .into_response();
+                }
+            }
+        } else if name == "artist" {
+            artist = field.text().await.unwrap_or_default();
+        } else if name == "title" {
+            title = field.text().await.unwrap_or_default();
+        }
+    }
+    let Some((fname, bytes)) = file else {
+        return (StatusCode::BAD_REQUEST,
+                Json(json!({"error": "pick a file to upload"})))
+            .into_response();
+    };
+    let ext = std::path::Path::new(&fname)
+        .extension()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_lowercase();
+    if !UPLOAD_EXTS.contains(&ext.as_str()) {
+        return (StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!(
+                    "unsupported file type '{ext}' — \
+                     mp3/m4a/ogg/wav/flac/mp4/webm/mkv")})))
+            .into_response();
+    }
+    if bytes.len() > UPLOAD_MAX_BYTES {
+        return (StatusCode::PAYLOAD_TOO_LARGE,
+                Json(json!({"error": "file too large (400 MB max)"})))
+            .into_response();
+    }
+    // "Artist - Title.ext" filename convention fills missing fields
+    let raw_stem = std::path::Path::new(&fname)
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    if let Some((a, t)) = raw_stem.split_once(" - ") {
+        if artist.trim().is_empty() {
+            artist = a.trim().to_string();
+        }
+        if title.trim().is_empty() {
+            title = t.trim().to_string();
+        }
+    }
+    let artist = if artist.trim().is_empty() {
+        "Unknown".to_string()
+    } else {
+        artist.trim().to_string()
+    };
+    let title = if title.trim().is_empty() {
+        raw_stem.clone()
+    } else {
+        title.trim().to_string()
+    };
+    let stem = sanitize_stem(&raw_stem);
+    let name = format!(
+        "upload-{}-{}{}",
+        crate::state::now_secs() as u64,
+        &stem[..stem.len().min(60)],
+        if ext.is_empty() { String::new() } else { format!(".{ext}") },
+    );
+    // one "Artist - Title" folder per upload — the catalog's folder
+    // convention gives rescan the right display names
+    let dir = app.st.root.join(format!(
+        "{} - {}",
+        sanitize_stem(&artist),
+        sanitize_stem(&title)
+    ));
+    let _ = std::fs::create_dir_all(&dir);
+    let dest = dir.join(&name);
+    if std::fs::write(&dest, &bytes).is_err() {
+        return (StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "could not save file"})))
+            .into_response();
+    }
+    let _ = app.st.rescan();
+    let entry_row = {
+        let entries = app.st.entries.read().unwrap();
+        entries.iter().find(|e| e.media == dest).map(|e| e.row(None))
+    };
+    let _ = app.io.emit("state", &app.st.snapshot()).await;
+    Json(json!({"ok": true, "entry": entry_row})).into_response()
+}
+
+/// POST /api/playlist — expand a remote playlist via yt-dlp
+/// (flat-playlist) and queue every song already in the library.
+/// The Rust app has no download provider, so entries without a local
+/// match count as skipped — prep them on a station to make them
+/// playable. Progress rides playlist:progress/playlist:done like
+/// Python's job.
+async fn api_playlist(AxState(app): AxState<Arc<App>>,
+                      headers: HeaderMap, Json(body): Json<Value>)
+    -> impl IntoResponse {
+    let (sid, _) = ensure_sid(&app, &headers);
+    let url = body["url"].as_str().unwrap_or("").trim().to_string();
+    if url.is_empty() {
+        return (StatusCode::BAD_REQUEST,
+                Json(json!({"error": "url required"})))
+            .into_response();
+    }
+    let name = body["name"].as_str().unwrap_or("").trim().to_string();
+    let perf_id = if !name.is_empty() {
+        let p = app.st.add_performer(&name[..name.len().min(24)]);
+        app.st.sessions.lock().unwrap()
+            .get_mut(&sid)
+            .map(|s| s.performer_id = Some(p.id));
+        p.id
+    } else {
+        let Some(pid) = sess(&app, &sid).performer_id else {
+            return (StatusCode::BAD_REQUEST,
+                    Json(json!({"error": "join with a display name first"})))
+                .into_response();
+        };
+        pid
+    };
+    let out = match tokio::process::Command::new("yt-dlp")
+        .args(["--flat-playlist", "-J", &url])
+        .output()
+        .await
+    {
+        Ok(o) if o.status.success() => o,
+        _ => {
+            return (StatusCode::BAD_GATEWAY,
+                    Json(json!({"error":
+                        "yt-dlp required for playlist import"})))
+                .into_response();
+        }
+    };
+    let doc: Value =
+        match serde_json::from_slice(&out.stdout) {
+            Ok(v) => v,
+            Err(_) => {
+                return (StatusCode::BAD_GATEWAY,
+                        Json(json!({"error": "could not read playlist"})))
+                    .into_response();
+            }
+        };
+    let pl_title =
+        doc["title"].as_str().unwrap_or("playlist").to_string();
+    let entries: Vec<Value> =
+        doc["entries"].as_array().cloned().unwrap_or_default();
+    let total = entries.len();
+    let job = format!("{:x}", crate::state::now_secs() as u64 & 0xffff_ffff);
+    let app2 = app.clone();
+    let job2 = job.clone();
+    let title2 = pl_title.clone();
+    tokio::spawn(async move {
+        let mut done = 0usize;
+        let (mut queued, mut skipped) = (0, 0);
+        for e in &entries {
+            let title = e["title"].as_str().unwrap_or("");
+            // match on normalized title (or "artist - title" form)
+            let want = norm_key(
+                title
+                    .rsplit_once(" - ")
+                    .map(|(_, t)| t)
+                    .unwrap_or(title),
+            );
+            let found = {
+                let ents = app2.st.entries.read().unwrap();
+                ents.iter()
+                    .find(|en| {
+                        norm_key(&en.title) == want
+                            || norm_key(&format!("{} - {}", en.artist, en.title))
+                                == norm_key(title)
+                    })
+                    .map(|en| en.id)
+            };
+            if let Some(entry_id) = found {
+                app2.st.queue_add(
+                    entry_id, perf_id, None,
+                    String::new(), None, None,
+                );
+                queued += 1;
+            } else {
+                skipped += 1;
+            }
+            done += 1;
+            let _ = app2.io.emit("playlist:progress", &json!({
+                "job": job2, "done": done, "total": total,
+                "queued": queued, "skipped": skipped,
+            })).await;
+        }
+        // queue_add can't fail per-entry locally — Python's failures
+        // were download errors; ours land under `skipped`
+        let failed = 0;
+        // idle queue auto-starts like a manual queue add
+        if app2.st.now_playing().is_none() {
+            app2.st.start_next();
+            Box::pin(sock::push_now_playing(&app2)).await;
+        }
+        let _ = app2.io.emit("state", &app2.st.snapshot()).await;
+        let _ = app2.io.emit("playlist:done", &json!({
+            "job": job2, "title": title2, "queued": queued,
+            "skipped": skipped, "failed": failed,
+        })).await;
+    });
+    Json(json!({"ok": true, "job": job, "title": pl_title,
+                "total": total}))
+    .into_response()
 }
 
 // -- router ------------------------------------------------------------------
@@ -1010,7 +1761,10 @@ pub fn router(app: Arc<App>, sio_layer: socketioxide::layer::SocketIoLayer) -> R
         .route("/api/playback/pause", post(api_pb_pause))
         .route("/api/playback/resume", post(api_pb_resume))
         .route("/api/playback/volume", post(api_pb_volume))
-        .route("/api/playback/sync", post(api_pb_sync))
+        .route("/api/playback/sync",
+               get(api_pb_sync_get).post(api_pb_sync))
+        .route("/api/playback/resync", post(api_pb_resync))
+        .route("/api/playback/autosync", post(api_pb_autosync))
         // mic/audio
         .route("/api/mic", get(api_mic).post(api_mic_set))
         .route("/api/mic/status", get(api_mic))
@@ -1018,6 +1772,22 @@ pub fn router(app: Arc<App>, sio_layer: socketioxide::layer::SocketIoLayer) -> R
         .route("/api/mic/assign", post(api_mic_assign))
         .route("/api/audio", get(api_audio))
         .route("/api/audio/status", get(api_audio))
+        .route("/api/audio/output", post(api_audio_output))
+        // library management (host) + uploads + playlists
+        .route("/api/manage/songs", get(api_manage_songs))
+        .route("/api/manage/entry/{id}/delete",
+               post(api_manage_entry_delete))
+        .route("/api/manage/entry/{id}/repair",
+               post(api_manage_entry_repair))
+        .route("/api/manage/song/{id}/delete",
+               post(api_manage_song_delete))
+        .route("/api/catalog/pending-charts", get(api_pending_charts))
+        .route("/api/catalog/chart/{id}/verify", post(api_chart_verify))
+        .route("/api/upload",
+               post(api_upload).layer(
+                   axum::extract::DefaultBodyLimit::max(
+                       UPLOAD_MAX_BYTES)))
+        .route("/api/playlist", post(api_playlist))
         .layer(sio_layer)
         .with_state(app)
 }

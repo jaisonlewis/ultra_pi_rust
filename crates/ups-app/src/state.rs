@@ -11,6 +11,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use ups_core::catalog;
 
+/// "Artist - Title" split — the filename/folder convention used by
+/// uploads and chart-library matching.
+pub fn split_artist_title(s: &str) -> (String, String) {
+    match s.split_once(" - ") {
+        Some((a, t)) => (a.trim().to_string(), t.trim().to_string()),
+        None => (String::new(), s.trim().to_string()),
+    }
+}
+
 pub fn now_secs() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -182,6 +191,13 @@ struct Persisted {
     next_performer: i64,
     next_queue_item: i64,
     host_performer_id: Option<i64>,
+    /// entry_id -> learned chart->media nudge (host sync buttons)
+    #[serde(default)]
+    sync_offsets: BTreeMap<i64, f64>,
+    #[serde(default)]
+    autosync_mic: Option<bool>,
+    #[serde(default)]
+    output_target: Option<String>,
 }
 
 pub struct State {
@@ -202,6 +218,12 @@ pub struct State {
     state_path: PathBuf,
     /// item_id -> epoch when its countdown ends
     pub play_at: Mutex<BTreeMap<i64, f64>>,
+    /// entry_id -> chart->media nudge (persists across restarts)
+    pub sync_offsets: Mutex<BTreeMap<i64, f64>>,
+    /// pitch-solve autosync toggle (GET/POST /playback/autosync)
+    pub autosync_mic: Mutex<bool>,
+    /// saved audio output (sink_name or card json) applied at boot
+    pub output_target: Mutex<Option<String>>,
 }
 
 #[derive(Clone)]
@@ -238,6 +260,9 @@ impl State {
             next_queue_item: Mutex::new(1),
             state_path,
             play_at: Mutex::new(BTreeMap::new()),
+            sync_offsets: Mutex::new(BTreeMap::new()),
+            autosync_mic: Mutex::new(true),
+            output_target: Mutex::new(None),
         };
         st.restore();
         st
@@ -264,6 +289,11 @@ impl State {
         *self.next_performer.get_mut().unwrap() = p.next_performer.max(1);
         *self.next_queue_item.get_mut().unwrap() = p.next_queue_item.max(1);
         *self.host_performer_id.get_mut().unwrap() = p.host_performer_id;
+        *self.sync_offsets.get_mut().unwrap() = p.sync_offsets;
+        if let Some(a) = p.autosync_mic {
+            *self.autosync_mic.get_mut().unwrap() = a;
+        }
+        *self.output_target.get_mut().unwrap() = p.output_target;
     }
 
     pub fn persist(&self) {
@@ -274,6 +304,9 @@ impl State {
             next_performer: *self.next_performer.lock().unwrap(),
             next_queue_item: *self.next_queue_item.lock().unwrap(),
             host_performer_id: *self.host_performer_id.lock().unwrap(),
+            sync_offsets: self.sync_offsets.lock().unwrap().clone(),
+            autosync_mic: Some(*self.autosync_mic.lock().unwrap()),
+            output_target: self.output_target.lock().unwrap().clone(),
         };
         let tmp = self.state_path.with_extension("tmp");
         if let Ok(s) = serde_json::to_string(&p) {
@@ -329,6 +362,30 @@ impl State {
         entries.retain(|e| keep.contains(&e.media));
         r.removed = before - entries.len();
         r
+    }
+
+    // -- sync / settings ----------------------------------------------------
+    /// Learned chart->media nudge for an entry (0 when untouched).
+    pub fn sync_offset(&self, entry_id: i64) -> f64 {
+        self.sync_offsets
+            .lock()
+            .unwrap()
+            .get(&entry_id)
+            .copied()
+            .unwrap_or(0.0)
+    }
+
+    pub fn set_sync_offset(&self, entry_id: i64, off_ms: f64) {
+        self.sync_offsets
+            .lock()
+            .unwrap()
+            .insert(entry_id, off_ms);
+        self.persist();
+    }
+
+    pub fn set_autosync_mic(&self, on: bool) {
+        *self.autosync_mic.lock().unwrap() = on;
+        self.persist();
     }
 
     // -- performers ---------------------------------------------------------

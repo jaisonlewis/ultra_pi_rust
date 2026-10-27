@@ -19,6 +19,9 @@ pub struct SingCtx {
     _mic: Option<MicSession>,
     pub tones: std::sync::Arc<Mutex<BTreeMap<String, Option<i64>>>>,
     pub last_ms: f64,
+    /// entry the session scores — sync offsets persist against it
+    pub entry_id: i64,
+    pub lyrics_rom: bool,
 }
 
 pub struct App {
@@ -33,6 +36,10 @@ pub struct App {
     /// native TV renderer present → don't wait on a browser
     pub native_tv: bool,
     pub paused: std::sync::atomic::AtomicBool,
+    /// host nudge mailbox for the native-TV session (absolute offset)
+    pub sync_override: Mutex<Option<f64>>,
+    /// POST /playback/resync flag the native-TV loop drains
+    pub resync_req: std::sync::atomic::AtomicBool,
     /// pw-loopback speaker monitor — None off-PipeWire hosts
     pub monitor: Option<crate::monitor::Monitor>,
 }
@@ -80,6 +87,7 @@ impl ups_tv::Driver for App {
             audio_only: e.audio_only,
             singer,
             tracks: e.tracks.clone(),
+            sync_offset: self.st.sync_offset(it.entry_id),
         })
     }
 
@@ -125,6 +133,41 @@ impl ups_tv::Driver for App {
 
     fn idle_info(&self) -> (String, String) {
         (self.join_url.clone(), self.join_url.clone())
+    }
+
+    fn autosync_enabled(&self) -> bool {
+        *self.st.autosync_mic.lock().unwrap()
+    }
+
+    fn take_sync_override(&self) -> Option<f64> {
+        self.sync_override.lock().unwrap().take()
+    }
+
+    fn take_resync_request(&self) -> bool {
+        self.resync_req
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn sync_offset_applied(&self, off: f64) {
+        if let Some(it) = self.st.now_playing() {
+            self.st.set_sync_offset(it.entry_id, off);
+            // phone-side lyrics/lanes refresh at the new offset
+            let chart_path = {
+                let ents = self.st.entries.read().unwrap();
+                ents.iter()
+                    .find(|e| e.id == it.entry_id)
+                    .and_then(|e| e.chart.clone())
+            };
+            if let Some(p) = chart_path {
+                let c = chart::load_chart(&p);
+                let rom =
+                    it.lyrics_rom.map(|v| v != 0).unwrap_or(false);
+                let _ = self.io.broadcast().emit(
+                    "lyrics",
+                    &chart::lane_payload(&c, rom, off, &[]),
+                );
+            }
+        }
     }
 }
 
@@ -185,7 +228,8 @@ fn now_playing_payload(app: &App, item: &QueueItem) -> Value {
     let lyrics = if scoring {
         let rom = item.lyrics_rom.map(|v| v != 0).unwrap_or(false);
         let c = chart::load_chart(entry.chart.as_ref().unwrap());
-        Some(chart::lane_payload(&c, rom, 0.0, &[]))
+        Some(chart::lane_payload(&c, rom,
+                                 app.st.sync_offset(entry.id), &[]))
     } else {
         None
     };
@@ -250,7 +294,8 @@ fn begin_sing(app: &App, item: &QueueItem, entry: &Entry) -> bool {
     if tracks.is_empty() {
         tracks = c.tracks.keys().take(1).cloned().collect();
     }
-    let session = Session::new(c, &tracks, app.st.difficulty, true);
+    let mut session = Session::new(c, &tracks, app.st.difficulty, true);
+    session.set_sync_offset(app.st.sync_offset(entry.id));
     let mic = MicSession::start(&tracks);
     let tones = mic
         .as_ref()
@@ -266,6 +311,8 @@ fn begin_sing(app: &App, item: &QueueItem, entry: &Entry) -> bool {
         _mic: mic,
         tones,
         last_ms: 0.0,
+        entry_id: entry.id,
+        lyrics_rom: item.lyrics_rom.map(|v| v != 0).unwrap_or(false),
     });
     ok
 }
@@ -396,8 +443,26 @@ pub fn register(io: &SocketIo, app: std::sync::Arc<App>) {
                         let mic_tone = tones.values().find_map(|v| *v);
                         let r = sing.session.tick(ms, &tones);
                         sing.last_ms = ms;
+                        // pitch-contour autosync — apply a confident
+                        // solve live and persist it against the entry
+                        let auto = if *app.st.autosync_mic.lock().unwrap() {
+                            sing.session.maybe_autosync(ms)
+                        } else {
+                            None
+                        };
+                        let mut sync_ev = None;
+                        if let Some(a) = &auto {
+                            if let Some(off) =
+                                a["offset_ms"].as_f64()
+                            {
+                                sing.session.set_sync_offset(off);
+                                app.st.set_sync_offset(
+                                    sing.entry_id, off);
+                                sync_ev = Some((a.clone(), off));
+                            }
+                        }
                         let mic_disp = mic_tone.map(|t| t % 12).unwrap_or(-1);
-                        json!({
+                        (json!({
                             "ms": ms,
                             "beat": r.beat,
                             "mic": mic_disp,
@@ -409,15 +474,29 @@ pub fn register(io: &SocketIo, app: std::sync::Arc<App>) {
                             "tone_str": mic_tone.map(tone_name),
                             "hit": r.last_hit,
                             "line_events": r.line_events,
-                        })
+                        }), sync_ev.map(|(a, off)| (a, off, sing.entry_id, sing.lyrics_rom)))
                     })
                 };
                 let _ = app.io.emit("clock", &json!({"ms": ms})).await;
-                if let Some(u) = upd {
+                if let Some((u, sync_ev)) = upd {
                     let _ = app.io.emit("sing:update", &u).await;
                     if let Some(events) = u["line_events"].as_array() {
                         for ev in events {
                             let _ = app.io.emit("sing:line", ev).await;
+                        }
+                    }
+                    if let Some((a, off, entry_id, rom)) = sync_ev {
+                        let _ = app.io.emit("sing:autosync", &a).await;
+                        // refresh lyrics/lanes at the new offset
+                        let chart_path = {
+                            let ents = app.st.entries.read().unwrap();
+                            ents.iter().find(|e| e.id == entry_id)
+                                .and_then(|e| e.chart.clone())
+                        };
+                        if let Some(p) = chart_path {
+                            let c = chart::load_chart(&p);
+                            let _ = app.io.emit("lyrics",
+                                &chart::lane_payload(&c, rom, off, &[])).await;
                         }
                     }
                 }

@@ -2,6 +2,7 @@
 //! REST/socket contract as the Python app: phones join on /, the kiosk
 //! drives <video> on /tv, and player:position ticks feed scoring.
 
+mod audio;
 mod mic;
 mod monitor;
 mod sock;
@@ -126,6 +127,27 @@ fn main() {
     eprintln!("ups-app: join url {}/", lan_addr(port));
     // mic passthrough — singers hear themselves (PipeWire only)
     let mon = monitor::start();
+    // restore the host's saved audio output (sink_name survives
+    // restarts where wpctl ids don't)
+    if let Some(saved) = st.output_target.lock().unwrap().clone() {
+        if audio::available() {
+            if let Ok(v) =
+                serde_json::from_str::<serde_json::Value>(&saved)
+            {
+                if let Some(n) = v["sink_name"].as_str() {
+                    let _ = audio::select_output(
+                        "sink_name",
+                        &serde_json::json!(n),
+                    );
+                } else if let Some(c) = v["card"].as_i64() {
+                    let _ = audio::select_output(
+                        "card",
+                        &serde_json::json!(c),
+                    );
+                }
+            }
+        }
+    }
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -146,6 +168,8 @@ fn main() {
                 auto_next: Mutex::new(0.0),
                 native_tv,
                 paused: std::sync::atomic::AtomicBool::new(false),
+                sync_override: Mutex::new(None),
+                resync_req: std::sync::atomic::AtomicBool::new(false),
                 monitor: mon,
             });
             // the loopback's playback node lands a beat after spawn —
