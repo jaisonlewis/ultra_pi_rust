@@ -107,13 +107,19 @@ pub trait Driver: Send + Sync {
 /// `UPS_RENDER_RES=<height>` renders smaller and lets the compositor
 /// upscale — framebuffer work and ffmpeg's scale target shrink
 /// ~4x going 1080p->720p, the biggest single CPU lever we have.
-/// 720p is the default; UPS_RENDER_RES=0 restores the native panel res.
+/// ARM boards (the Pi) default to 720p; desktops render native.
+/// UPS_RENDER_RES=0 forces the native panel res on any platform.
 fn screen_size() -> (usize, usize) {
     let mut wh = native_size();
+    let default = if cfg!(any(target_arch = "aarch64", target_arch = "arm")) {
+        720
+    } else {
+        0
+    };
     let target = std::env::var("UPS_RENDER_RES")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(720);
+        .unwrap_or(default);
     if target >= 240 && wh.1 > target {
         wh.0 = wh.0 * target / wh.1;
         wh.1 = target;
