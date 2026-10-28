@@ -107,17 +107,16 @@ pub trait Driver: Send + Sync {
 /// `UPS_RENDER_RES=<height>` renders smaller and lets the compositor
 /// upscale — framebuffer work and ffmpeg's scale target shrink
 /// ~4x going 1080p->720p, the biggest single CPU lever we have.
+/// 720p is the default; UPS_RENDER_RES=0 restores the native panel res.
 fn screen_size() -> (usize, usize) {
     let mut wh = native_size();
-    if let Some(target) = std::env::var("UPS_RENDER_RES")
+    let target = std::env::var("UPS_RENDER_RES")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
-        .filter(|&n| n >= 240)
-    {
-        if wh.1 > target {
-            wh.0 = wh.0 * target / wh.1;
-            wh.1 = target;
-        }
+        .unwrap_or(720);
+    if target >= 240 && wh.1 > target {
+        wh.0 = wh.0 * target / wh.1;
+        wh.1 = target;
     }
     (wh.0 & !1, wh.1 & !1)
 }
