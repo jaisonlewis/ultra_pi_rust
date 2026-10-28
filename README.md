@@ -174,7 +174,7 @@ tool degrades gracefully when absent.
 
 | platform | build | notes |
 |---|---|---|
-| Raspberry Pi (labwc/Wayland) | `cargo build --release -p ups-app` | fullscreen via labwc windowRule (`app_id=ultra-pi-star`); PipeWire mic monitor active; `/sys/class/drm` picks native panel res |
+| Raspberry Pi (labwc/Wayland) | `cargo build --release -p ups-app` | fullscreen + 720p out via `scripts/pi-display.sh` (installs the `ultra-pi-star` labwc windowRule + autostart); PipeWire mic monitor active; renders at 720p by default (`UPS_RENDER_RES=0` for native) |
 | Windows | `cargo build --release -p ups-tv` | works today; `ffmpeg.exe` on PATH; windowed 1280×720 (no /sys probe) — Esc quits |
 | macOS | `cargo build --release -p ups-tv` | `brew install ffmpeg`; build natively on the Mac (no practical cross-compile); fonts auto-resolve to Helvetica |
 
