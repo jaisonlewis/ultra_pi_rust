@@ -260,6 +260,7 @@ fn expand_source(args: &Args, src: &str) -> Result<Vec<String>> {
 
 /// YouTube search → (watch-url, "title — channel") pairs via yt-dlp
 /// `ytsearch`. Flat metadata only — the GUI lists them for picking.
+#[allow(dead_code)] // GUI-only caller (feature-gated)
 fn yt_search(args: &Args, query: &str, n: usize)
         -> Result<Vec<(String, String)>> {
     let spec = format!("ytsearch{n}:{query}");
@@ -288,6 +289,7 @@ fn yt_search(args: &Args, query: &str, n: usize)
 
 /// yt-ids already prepared under `library` — search hits matching one
 /// are shown "in library" so they aren't re-prepped.
+#[allow(dead_code)] // GUI-only caller (feature-gated)
 fn library_video_ids(
         library: &Path) -> std::collections::HashSet<String> {
     ups_core::catalog::scan(library).iter()
@@ -449,7 +451,7 @@ fn main() -> Result<()> {
         return run_batch(&args);
     }
     if args.dl_models {
-        return models::download(&args.models);
+        return models::download(&args.models, None);
     }
     prep_many(&args, &[args.source.clone()])
 }
@@ -519,14 +521,20 @@ fn prep(args: &Args) -> Result<()> {
     // ASR — word onsets for chart generation + lyric anchoring.
     // Vocal stem first; full media when the stem won't transcribe.
     let mut asr_words: Vec<asr::AsrWord> = Vec::new();
+    let mut asr_lang: Option<String> = None;
+    let mut asr_engine = "none";
     if asr::have_models(&args.models) {
         stage("transcribing (asr)");
         let voc = stem_path("vocals.wav");
         let stem = voc.exists().then_some(voc.as_path());
         match asr::transcribe_media(&media, stem, &args.models) {
-            Ok(w) => {
-                say!("asr: {} words", w.len());
-                asr_words = w;
+            Ok(o) => {
+                say!("asr: {} words ({}, lang {})",
+                         o.words.len(), o.engine,
+                         o.lang.as_deref().unwrap_or("?"));
+                asr_lang = o.lang;
+                asr_engine = o.engine;
+                asr_words = o.words;
             }
             Err(e) => say!("asr failed: {e}"),
         }
@@ -538,30 +546,41 @@ fn prep(args: &Args) -> Result<()> {
     stage("fetching lyrics");
     let dur = ff::duration(&media).ok();
     let mut recs: Vec<lyrics::LyricRecord> = Vec::new();
-    let mut seen: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
-    let push_rec = |r: Option<lyrics::LyricRecord>,
-                        recs: &mut Vec<lyrics::LyricRecord>,
-                        seen: &mut std::collections::HashSet<String>| {
-        if let Some(r) = r {
-            let key = format!("{}|{}", r.artist_name, r.track_name);
-            if seen.insert(key) {
-                recs.push(r);
-            }
-        }
-    };
-    for (a, t) in lyrics::yt_candidates(&artist, &title) {
-        push_rec(lyrics::fetch(&a, &t, dur), &mut recs, &mut seen);
+    let cands = lyrics::yt_candidates(&artist, &title);
+    for (a, t) in &cands {
+        push_rec(lyrics::fetch(a, t, dur), &mut recs);
+    }
+    // alternates on the likeliest candidates — synclrc and lrcmux
+    // both carry synced LRC (synclrc covers Indian languages well,
+    // lrcmux fans out to deezer/musixmatch/etc itself)
+    for (a, t) in cands.iter().take(3) {
+        push_rec(lyrics::synclrc(a, t, dur), &mut recs);
+        push_rec(lyrics::lrcmux(a, t), &mut recs);
     }
     let q = format!("{artist} {title}").trim().to_string();
     for r in lyrics::search(&q, dur) {
-        push_rec(Some(r), &mut recs, &mut seen);
+        push_rec(Some(r), &mut recs);
+    }
+    // plain-text / search fallbacks when nothing synced landed —
+    // jiosaavn carries Indic lyrics + language tags, synclrc_search
+    // covers name variants the exact lookups missed
+    if recs.iter().all(|r| r.synced.is_empty()) {
+        for r in lyrics::jiosaavn(&q, dur) {
+            push_rec(Some(r), &mut recs);
+        }
+        if !cands.is_empty() {
+            let (a, t) = &cands[0];
+            push_rec(lyrics::ovh(a, t), &mut recs);
+        }
+        for r in lyrics::synclrc_search(&q, dur) {
+            push_rec(Some(r), &mut recs);
+        }
     }
     let asr_norm: Vec<(String, f64)> = wordmap::norm_asr(
         &asr_words.iter()
             .map(|w| (w.word.clone(), w.start_ms, w.end_ms))
             .collect::<Vec<_>>());
-    let rec = recs.into_iter()
+    let rec = recs.iter()
         .map(|r| {
             let lines: Vec<String> = if r.synced.is_empty() {
                 r.plain.clone()
@@ -575,21 +594,71 @@ fn prep(args: &Args) -> Result<()> {
         })
         .max_by_key(|(u, _)| *u)
         .filter(|(u, _)| *u >= 3)
-        .map(|(_, r)| r);
+        .map(|(_, r)| r.clone())
+        // foreign-language records score ~0 against a script-
+        // mismatched ASR — fall back to the synced record whose
+        // provider-reported duration agrees with the media
+        .or_else(|| recs.iter()
+            .filter(|r| !r.synced.is_empty())
+            .filter_map(|r| {
+                dur.and_then(|d| r.duration.map(|g| (g - d).abs()))
+                    .map(|delta| (delta, r))
+            })
+            .filter(|(delta, _)| *delta <= 4.0)
+            .min_by(|a, b| a.0.partial_cmp(&b.0)
+                .unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(_, r)| r.clone()));
     if let Some(r) = &rec {
         say!("lyrics: {} synced / {} plain lines \
-                  ({} — {})",
+                  ({} — {}, {})",
                  r.synced.len(), r.plain.len(),
-                 r.artist_name, r.track_name);
+                 r.artist_name, r.track_name, r.source);
     } else {
         say!("lyrics: none found");
+    }
+
+    // language coverage — the alerts the user asked for: a script we
+    // can't romanize, or a non-English song with no whisper model
+    let lyric_text = rec.as_ref().map(|r| {
+        if r.synced.is_empty() {
+            r.plain.join("\n")
+        } else {
+            r.synced.iter().map(|(_, t)| t.as_str())
+                .collect::<Vec<_>>().join("\n")
+        }
+    });
+    if let Some(txt) = &lyric_text {
+        for sc in ups_core::romanize::scripts_in(txt) {
+            if !ups_core::romanize::romanizable(sc) {
+                say!("⚠ {} script can't be romanized yet — \
+                          rom toggle will keep native text",
+                         ups_core::romanize::script_name(sc));
+            }
+            if !models::font_installed(&args.models, sc) {
+                say!("⚠ no {} font installed — native lyrics may \
+                          draw as boxes on the TV (Download models \
+                          → Language packs → Fonts)",
+                         ups_core::romanize::script_name(sc));
+            }
+        }
+    }
+    let foreign = asr_lang.as_deref().map_or(false, |l| l != "en")
+        || rec.as_ref().and_then(|r| r.lang.as_deref())
+            .map_or(false, |l| l != "english" && l != "en")
+        || lyric_text.as_deref()
+            .map_or(false, |t| ups_core::romanize::script_of(t)
+                != "latin");
+    if foreign && !asr::have_whisper(&args.models) {
+        say!("⚠ non-English song but no multilingual ASR model — \
+              grab a whisper pack via Download models");
     }
 
     // phase 2 — chart: import + chroma-align to THIS media, then bake
     // to absolute media-ms so the player needs no warp machinery
     if let Some(chart_path) = &args.chart {
         stage("importing chart");
-        let chart = ups_core::chart::load_chart(chart_path);
+        let mut chart = ups_core::chart::load_chart(chart_path);
+        ups_core::romanize::romanize_chart(&mut chart);
         let dest = stem_path("upsong");
         if (chart.bpm() - 15000.0).abs() > 1.0 {
             stage("aligning chart to media");
@@ -644,7 +713,8 @@ fn prep(args: &Args) -> Result<()> {
         "has_inst": stem_path("inst.mp4").exists(),
         "has_chart": stem_path("upsong").exists(),
         "asr": {
-            "engine": "sherpa-onnx parakeet-tdt-0.6b-v3",
+            "engine": asr_engine,
+            "lang": asr_lang,
             "words": asr_words.len(),
             "words_ms": asr_words.iter()
                 .map(|w| serde_json::json!([w.start_ms, w.word]))
@@ -657,6 +727,26 @@ fn prep(args: &Args) -> Result<()> {
     let _ = std::fs::remove_dir_all(&dl_dir);
     say!("done → {}", folder.display());
     Ok(())
+}
+
+/// Dedupe lyric records by song identity — a later synced record
+/// upgrades an earlier plain-only hit for the same song.
+fn push_rec(r: Option<lyrics::LyricRecord>,
+            recs: &mut Vec<lyrics::LyricRecord>) {
+    let Some(r) = r else { return };
+    let key = format!("{}|{}",
+        r.artist_name.to_lowercase().trim(),
+        r.track_name.to_lowercase().trim());
+    let key_of = |e: &lyrics::LyricRecord| format!("{}|{}",
+        e.artist_name.to_lowercase().trim(),
+        e.track_name.to_lowercase().trim());
+    if let Some(ex) = recs.iter_mut().find(|e| key_of(e) == key) {
+        if ex.synced.is_empty() && !r.synced.is_empty() {
+            *ex = r;
+        }
+        return;
+    }
+    recs.push(r);
 }
 
 /// `ups-prep batch --library <root>` — regenerate machine-made charts
@@ -749,9 +839,10 @@ fn batch_one(args: &Args, song: &ups_core::catalog::Song) -> Result<bool> {
             }
             let voc = song.dir.join(format!("{stem}.vocals.wav"));
             let stem_ref = voc.exists().then_some(voc.as_path());
-            let w = asr::transcribe_media(&song.media, stem_ref,
+            let o = asr::transcribe_media(&song.media, stem_ref,
                                           &args.models)?;
-            say!("  asr: {} words", w.len());
+            let w = o.words;
+            say!("  asr: {} words ({})", w.len(), o.engine);
             if w.len() < 20 {
                 return Ok(false);
             }
@@ -761,7 +852,8 @@ fn batch_one(args: &Args, song: &ups_core::catalog::Song) -> Result<bool> {
                     serde_json::from_slice::<serde_json::Value>(&bytes)
                 {
                     j["asr"] = serde_json::json!({
-                        "engine": "sherpa-onnx parakeet-tdt-0.6b-v3",
+                        "engine": o.engine,
+                        "lang": o.lang,
                         "words": w.len(),
                         "words_ms": w.iter()
                             .map(|x| serde_json::json!(
@@ -820,13 +912,13 @@ fn batch_one(args: &Args, song: &ups_core::catalog::Song) -> Result<bool> {
                  &asr_words, &dest, rec.as_ref()))
 }
 
-/// Cached transcript from `<stem>.analysis.json` when the ASR engine
-/// is already parakeet — avoids re-transcribing on every batch run.
+/// Cached transcript from `<stem>.analysis.json` when it was written
+/// by a known ASR engine — avoids re-transcribing on every batch run.
 fn read_cached_asr(ana_path: &Path) -> Option<Vec<asr::AsrWord>> {
     let j: serde_json::Value =
         serde_json::from_slice(&std::fs::read(ana_path).ok()?).ok()?;
     let engine = j["asr"]["engine"].as_str().unwrap_or("");
-    if !engine.contains("parakeet") {
+    if !(engine.contains("parakeet") || engine.contains("whisper")) {
         return None;
     }
     let words = j["asr"]["words_ms"].as_array()?.iter()

@@ -47,6 +47,7 @@ struct PrepApp {
     hevc: bool,
     search: String,
     hits: Vec<(String, String, bool, bool)>, // url,label,in-lib,checked
+    packs: Vec<(String, bool)>,   // language pack id → selected
     busy: bool,
     status: String,
     log: std::collections::VecDeque<String>,
@@ -55,12 +56,22 @@ struct PrepApp {
 
 impl Default for PrepApp {
     fn default() -> Self {
+        let models = std::env::var("UPS_MODELS_DIR")
+            .unwrap_or_else(|_| "models".into());
+        let sel = crate::models::load_packs(
+            std::path::Path::new(&models));
+        let mut packs: Vec<(String, bool)> = crate::models::ASR_PACKS
+            .iter().map(|(id, ..)| (*id, sel.contains(*id)))
+            .map(|(id, on)| (id.to_string(), on))
+            .collect();
+        packs.extend(crate::models::FONT_PACKS.iter()
+            .map(|(s, ..)| (format!("font:{s}"),
+                            sel.contains(&format!("font:{s}")))));
         PrepApp {
             source: String::new(),
             queue: String::new(),
             library: String::new(),
-            models: std::env::var("UPS_MODELS_DIR")
-                .unwrap_or_else(|_| "models".into()),
+            models,
             artist: String::new(),
             title: String::new(),
             chart: String::new(),
@@ -69,6 +80,7 @@ impl Default for PrepApp {
             hevc: false,
             search: String::new(),
             hits: Vec::new(),
+            packs,
             busy: false,
             status: String::new(),
             log: std::collections::VecDeque::new(),
@@ -116,6 +128,9 @@ impl PrepApp {
             .map(str::to_string)
             .collect();
         let query = self.search.trim().to_string();
+        let packs: std::collections::HashSet<String> =
+            self.packs.iter().filter(|(_, on)| *on)
+                .map(|(id, _)| id.clone()).collect();
         std::thread::spawn(move || {
             let r = match job {
                 Job::Prep => crate::prep_many(&args,
@@ -136,13 +151,30 @@ impl PrepApp {
                     }
                 }),
                 Job::Batch => crate::run_batch(&args),
-                Job::Models => crate::models::download(&args.models),
+                Job::Models =>
+                    crate::models::download(&args.models, Some(&packs)),
             };
             let _ = tx.send(match r {
                 Ok(()) => DONE.to_string(),
                 Err(e) => format!("{ERR}{e:#}"),
             });
         });
+    }
+
+    /// Persist the checkbox set to <models>/langs.json — the file the
+    /// CLI `models` download and future GUI launches both read.
+    fn save_pack_selection(&self) {
+        let set: std::collections::HashSet<String> =
+            self.packs.iter().filter(|(_, on)| *on)
+                .map(|(id, _)| id.clone()).collect();
+        let mdir = if self.models.trim().is_empty() {
+            PathBuf::from("models")
+        } else {
+            PathBuf::from(self.models.trim())
+        };
+        if let Err(e) = crate::models::save_packs(&mdir, &set) {
+            eprintln!("packs save failed: {e}");
+        }
     }
 
     fn field(ui: &mut egui::Ui, label: &str, s: &mut String,
@@ -293,6 +325,57 @@ impl eframe::App for PrepApp {
                                 "encode .inst.mp4 as HEVC — the Pi 5 \
                                  decodes it in hardware, h264 it can't");
                         ui.end_row();
+                    });
+
+                ui.add_space(4.0);
+                egui::CollapsingHeader::new("Language packs")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        ui.label(
+                            "what 'Download models' fetches on top \
+                             of the base pack — whisper covers every \
+                             language at once; fonts let the TV \
+                             render native scripts");
+                        ui.horizontal(|ui| {
+                            ui.label("ASR:").on_hover_text(
+                                "whisper auto-detects the song's \
+                                 language and transcribes it; pick \
+                                 the size that fits — tiny is fine \
+                                 for most, small is more accurate");
+                            let mut changed = false;
+                            for (id, on) in self.packs.iter_mut()
+                                    .filter(|(id, _)| {
+                                        !id.starts_with("font:")}) {
+                                let label = crate::models::ASR_PACKS
+                                    .iter().find(|(pid, ..)| *pid == id)
+                                    .map(|(.., l)| *l)
+                                    .unwrap_or(id.as_str());
+                                changed |= ui.checkbox(on, label)
+                                    .changed();
+                            }
+                            if changed {
+                                self.save_pack_selection();
+                            }
+                        });
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("Fonts:").on_hover_text(
+                                "native-script fonts the TV renderer \
+                                 falls back to — tick the scripts \
+                                 your songs use");
+                            let mut changed = false;
+                            for (id, on) in self.packs.iter_mut()
+                                    .filter(|(id, _)| {
+                                        id.starts_with("font:")}) {
+                                let name = ups_core::romanize
+                                    ::script_name(id.trim_start_matches(
+                                        "font:"));
+                                changed |= ui.checkbox(on, name)
+                                    .changed();
+                            }
+                            if changed {
+                                self.save_pack_selection();
+                            }
+                        });
                     });
 
                 ui.add_space(4.0);

@@ -55,17 +55,30 @@ fn bold_font() -> Option<Vec<u8>> {
 /// `fonts/` next to the binary and it renders.
 fn font_dirs() -> Vec<std::path::PathBuf> {
     let mut dirs = Vec::new();
+    if let Ok(e) = std::env::var("UPS_FONTS_DIR") {
+        if !e.is_empty() {
+            dirs.push(e.into());
+        }
+    }
+    if let Ok(e) = std::env::var("UPS_MODELS_DIR") {
+        if !e.is_empty() {
+            dirs.push(format!("{e}/fonts").into());
+        }
+    }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(d) = exe.parent() {
             dirs.push(d.join("fonts"));
+            dirs.push(d.join("models/fonts"));
             // source checkout layout: <repo>/target/release/ups-app
             if let Some(repo) = d.parent().and_then(|t| t.parent()).and_then(|t| t.parent()) {
                 dirs.push(repo.join("fonts"));
+                dirs.push(repo.join("models/fonts"));
             }
         }
     }
     if let Ok(cwd) = std::env::current_dir() {
         dirs.push(cwd.join("fonts"));
+        dirs.push(cwd.join("models/fonts"));
     }
     dirs.push("/home/jaison/ups-rust/fonts".into());
     dirs.push("/usr/share/fonts/ups".into());

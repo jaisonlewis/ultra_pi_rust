@@ -142,5 +142,45 @@ fn romanize_script_detection() {
     assert_eq!(ups_core::romanize::script_of("かな革命"), "jp");
     assert_eq!(ups_core::romanize::script_of("사랑해"), "kr");
     assert_eq!(ups_core::romanize::script_of("Москва"), "cyr");
+    assert_eq!(ups_core::romanize::script_of("तुम ही हो"), "deva");
+    assert_eq!(ups_core::romanize::script_of("ไทย"), "thai");
+    assert_eq!(ups_core::romanize::script_of("שלום"), "hebr");
+    assert_eq!(ups_core::romanize::script_of("γεια"), "grek");
     assert_eq!(ups_core::romanize::script_of("hello"), "latin");
+}
+
+#[test]
+fn romanize_indic_and_friends() {
+    // Devanagari — "tum hi ho" (inherent vowels + matras + virama)
+    let mut c = demo_chart();
+    c.tracks.get_mut("P1").unwrap()[0].text = "तुम ही हो".into();
+    c.tracks.get_mut("P1").unwrap()[1].text = "प्यार".into();
+    ups_core::romanize::romanize_chart(&mut c);
+    let ns = &c.tracks["P1"];
+    assert_eq!(ns[0].alt, "tum hee ho");
+    assert_eq!(ns[1].alt, "pyaar");
+
+    // nukta forms — ज़ = z, ड़ = r
+    let mut c2 = demo_chart();
+    c2.tracks.get_mut("P1").unwrap()[0].text = "ज़िंदगी".into();
+    ups_core::romanize::romanize_chart(&mut c2);
+    assert_eq!(c2.tracks["P1"][0].alt, "zindagee");
+
+    // Bengali's inherent vowel is "o"
+    let mut c3 = demo_chart();
+    c3.tracks.get_mut("P1").unwrap()[0].text = "ভালোবাসা".into();
+    ups_core::romanize::romanize_chart(&mut c3);
+    assert_eq!(c3.tracks["P1"][0].alt, "bhalobasa");
+
+    // Greek / Hebrew / Thai via the simple maps
+    let mut c4 = demo_chart();
+    c4.tracks.get_mut("P1").unwrap()[0].text = "αγάπη".into();
+    ups_core::romanize::romanize_chart(&mut c4);
+    assert_eq!(c4.tracks["P1"][0].alt, "agapi");
+
+    // unsupported scripts get no alt (native stays)
+    let mut c5 = demo_chart();
+    c5.tracks.get_mut("P1").unwrap()[0].text = "ខ្មែរ".into();
+    ups_core::romanize::romanize_chart(&mut c5);
+    assert!(c5.tracks["P1"][0].alt.is_empty());
 }
