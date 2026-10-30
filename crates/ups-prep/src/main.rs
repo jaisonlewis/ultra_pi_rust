@@ -68,6 +68,27 @@ struct Args {
     gui: bool,
 }
 
+impl Args {
+    /// Same options against a different source — playlist members and
+    /// GUI queue lines all share the library/models/hevc settings.
+    fn for_source(&self, source: String) -> Args {
+        Args {
+            source,
+            library: self.library.clone(),
+            models: self.models.clone(),
+            chart: self.chart.clone(),
+            artist: self.artist.clone(),
+            title: self.title.clone(),
+            guide: self.guide,
+            no_separate: self.no_separate,
+            hevc: self.hevc,
+            batch: self.batch,
+            dl_models: self.dl_models,
+            gui: self.gui,
+        }
+    }
+}
+
 fn parse_args() -> Result<Args> {
     let mut a = std::env::args().skip(1);
     let mut args = Args {
@@ -101,7 +122,8 @@ fn parse_args() -> Result<Args> {
             "--hevc" => args.hevc = true,
             "-h" | "--help" => {
                 println!(
-                    "ups-prep <youtube-url | media-file> [opts]\n\
+                    "ups-prep <youtube-url | playlist-url | media-file> \
+                     [opts]\n\
                      ups-prep batch --library DIR   regenerate charts\n\
                      ups-prep models [--models DIR]  download the model \
                      + binary pack\n\
@@ -117,6 +139,9 @@ fn parse_args() -> Result<Args> {
                      \x20 --hevc           encode .inst.mp4 as HEVC —\n\
                      \x20                  hw-decoded on the Pi 5\n\
                      \x20 --gui            open the prep window\n\n\
+                     a playlist url expands to every video in it;\n\
+                     artist/title/chart overrides only apply when a\n\
+                     single song is being prepared.\n\n\
                      batch re-runs ASR + RMVPE + genchart on every song\n\
                      whose .upsong was machine-generated (CREATOR\n\
                      ultrapistar-genchart) or missing; imported charts\n\
@@ -139,6 +164,137 @@ fn parse_args() -> Result<Args> {
 
 fn stage(label: &str) {
     say!("==> {label}");
+}
+
+/// When `src` is a playlist URL, return the member video urls;
+/// otherwise a one-element vec holding `src` itself (single video or
+/// local file). Flat metadata only — no downloads.
+fn expand_source(src: &str) -> Result<Vec<String>> {
+    if !src.contains("://") && !src.starts_with("www.") {
+        return Ok(vec![src.to_string()]);
+    }
+    let out = Command::new("yt-dlp")
+        .args([
+            "--extractor-args", "youtube:player_client=android",
+            "--flat-playlist", "--no-warnings", "-J",
+        ])
+        .arg(src)
+        .output()
+        .context("spawn yt-dlp")?;
+    if !out.status.success() {
+        bail!("yt-dlp: {}", String::from_utf8_lossy(&out.stderr)
+            .lines().last().unwrap_or("failed"));
+    }
+    let j: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .context("yt-dlp -J")?;
+    let Some(entries) = j["entries"].as_array() else {
+        return Ok(vec![src.to_string()]);
+    };
+    let mut urls = Vec::new();
+    for e in entries {
+        let u = e["webpage_url"].as_str()
+            .or(e["url"].as_str())
+            .map(str::to_string)
+            .or_else(|| e["id"].as_str()
+                .map(|id| format!(
+                    "https://www.youtube.com/watch?v={id}")));
+        if let Some(u) = u {
+            urls.push(if u.contains("://") { u } else {
+                format!("https://www.youtube.com/watch?v={u}")
+            });
+        }
+    }
+    urls.dedup();
+    if urls.is_empty() { Ok(vec![src.to_string()]) } else { Ok(urls) }
+}
+
+/// YouTube search → (watch-url, "title — channel") pairs via yt-dlp
+/// `ytsearch`. Flat metadata only — the GUI lists them for picking.
+fn yt_search(query: &str, n: usize) -> Result<Vec<(String, String)>> {
+    let spec = format!("ytsearch{n}:{query}");
+    let out = Command::new("yt-dlp")
+        .args([
+            "--extractor-args", "youtube:player_client=android",
+            "--flat-playlist", "--no-warnings", "-J",
+        ])
+        .arg(&spec)
+        .output()
+        .context("spawn yt-dlp")?;
+    if !out.status.success() {
+        bail!("yt-dlp: {}", String::from_utf8_lossy(&out.stderr)
+            .lines().last().unwrap_or("failed"));
+    }
+    let j: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .context("yt-dlp -J")?;
+    let mut hits = Vec::new();
+    for e in j["entries"].as_array().into_iter().flatten() {
+        let Some(id) = e["id"].as_str() else { continue };
+        let title = e["title"].as_str().unwrap_or(id);
+        let chan = e["channel"].as_str()
+            .or(e["uploader"].as_str()).unwrap_or("");
+        let label = if chan.is_empty() { title.to_string() }
+            else { format!("{title} — {chan}") };
+        hits.push((format!("https://www.youtube.com/watch?v={id}"),
+                   label));
+    }
+    Ok(hits)
+}
+
+/// yt-ids already prepared under `library` — search hits matching one
+/// are shown "in library" so they aren't re-prepped.
+fn library_video_ids(
+        library: &Path) -> std::collections::HashSet<String> {
+    ups_core::catalog::scan(library).iter()
+        .filter_map(|s| s.media.file_stem()
+            .and_then(|st| st.to_str())
+            .and_then(|st| st.strip_prefix("yt-"))
+            .map(str::to_string))
+        .collect()
+}
+
+/// Run the one-song pipeline over `urls`, expanding any playlist URL
+/// through yt-dlp. Artist/title/chart overrides only make sense for a
+/// single song — they're dropped on multi-entry sources.
+fn prep_many(args: &Args, urls: &[String]) -> Result<()> {
+    let mut expanded: Vec<String> = Vec::new();
+    for u in urls {
+        match expand_source(u) {
+            Ok(m) => expanded.extend(m),
+            Err(e) => say!("expand {u}: {e:#}"),
+        }
+    }
+    expanded.dedup();
+    if expanded.is_empty() {
+        bail!("nothing to prepare");
+    }
+    let single = expanded.len() == 1;
+    let total = expanded.len();
+    if total > 1 {
+        say!("playlist/queue: {total} videos");
+    }
+    let (mut ok, mut failed) = (0u32, 0u32);
+    for (i, u) in expanded.iter().enumerate() {
+        if total > 1 {
+            say!("==> [{}/{}] {}", i + 1, total, u);
+        }
+        let mut one = args.for_source(u.clone());
+        if !single {
+            one.artist = None;
+            one.title = None;
+            one.chart = None;
+        }
+        match prep(&one) {
+            Ok(()) => ok += 1,
+            Err(e) => {
+                say!("  failed: {e:#}");
+                failed += 1;
+            }
+        }
+    }
+    if total > 1 {
+        say!("queue done: {ok} prepared, {failed} failed");
+    }
+    Ok(())
 }
 
 struct MediaInfo {
@@ -243,7 +399,7 @@ fn main() -> Result<()> {
     if args.dl_models {
         return models::download(&args.models);
     }
-    prep(&args)
+    prep_many(&args, &[args.source.clone()])
 }
 
 /// The one-song pipeline: fetch → normalize → separate → karaoke →

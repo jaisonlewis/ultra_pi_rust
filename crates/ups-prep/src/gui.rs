@@ -10,9 +10,12 @@ use eframe::egui;
 
 const DONE: &str = "job://done";
 const ERR: &str = "job://error ";
+const HIT: &str = "hit://";
 
 enum Job {
     Prep,
+    Queue,
+    Search,
     Batch,
     Models,
 }
@@ -33,6 +36,7 @@ pub fn run() -> anyhow::Result<()> {
 
 struct PrepApp {
     source: String,
+    queue: String,
     library: String,
     models: String,
     artist: String,
@@ -41,6 +45,8 @@ struct PrepApp {
     guide: f32,
     no_separate: bool,
     hevc: bool,
+    search: String,
+    hits: Vec<(String, String, bool, bool)>, // url,label,in-lib,checked
     busy: bool,
     status: String,
     log: std::collections::VecDeque<String>,
@@ -51,6 +57,7 @@ impl Default for PrepApp {
     fn default() -> Self {
         PrepApp {
             source: String::new(),
+            queue: String::new(),
             library: String::new(),
             models: std::env::var("UPS_MODELS_DIR")
                 .unwrap_or_else(|_| "models".into()),
@@ -60,6 +67,8 @@ impl Default for PrepApp {
             guide: 0.15,
             no_separate: false,
             hevc: false,
+            search: String::new(),
+            hits: Vec::new(),
             busy: false,
             status: String::new(),
             log: std::collections::VecDeque::new(),
@@ -100,9 +109,29 @@ impl PrepApp {
         self.busy = true;
         self.status = "working…".into();
         let args = self.args(matches!(job, Job::Batch));
+        let queue_urls: Vec<String> = self.queue.lines()
+            .flat_map(|l| l.split_whitespace())
+            .map(str::to_string)
+            .collect();
+        let query = self.search.trim().to_string();
         std::thread::spawn(move || {
             let r = match job {
-                Job::Prep => crate::prep(&args),
+                Job::Prep => crate::prep_many(&args,
+                                              &[args.source.clone()]),
+                Job::Queue => crate::prep_many(&args, &queue_urls),
+                Job::Search => crate::yt_search(&query, 15).map(|hits| {
+                    let have = if args.library.as_os_str().is_empty() {
+                        Default::default()
+                    } else {
+                        crate::library_video_ids(&args.library)
+                    };
+                    for (url, label) in hits {
+                        let id = url.rsplit('=').next().unwrap_or("");
+                        let _ = tx.send(format!(
+                            "{HIT}{url}\t{label}\t{}",
+                            have.contains(id)));
+                    }
+                }),
                 Job::Batch => crate::run_batch(&args),
                 Job::Models => crate::models::download(&args.models),
             };
@@ -149,6 +178,13 @@ impl eframe::App for PrepApp {
                     self.status = format!("failed: {e}");
                     crate::set_log_sink(None);
                     self.log.push_back(format!("FAILED: {e}"));
+                } else if let Some(h) = m.strip_prefix(HIT) {
+                    let mut p = h.split('\t');
+                    if let (Some(u), Some(l), Some(hv)) =
+                            (p.next(), p.next(), p.next()) {
+                        self.hits.push((u.to_string(), l.to_string(),
+                                        hv == "true", false));
+                    }
                 } else {
                     // cap the pane — batch over a big library would
                     // otherwise grow without bound
@@ -176,9 +212,10 @@ impl eframe::App for PrepApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("Ultra Pi Star — song prep");
             ui.label(
-                "Paste a YouTube link or pick a media file; the song \
-                 lands in the library folder as a complete \
-                 stick-format entry (karaoke video, chart, art).",
+                "Paste a YouTube link — a single video or a whole \
+                 playlist — or pick a media file; the song lands in \
+                 the library folder as a complete stick-format entry \
+                 (karaoke video, chart, art).",
             );
             ui.add_space(6.0);
 
@@ -230,6 +267,66 @@ impl eframe::App for PrepApp {
                                  decodes it in hardware, h264 it can't");
                         ui.end_row();
                     });
+
+                ui.add_space(4.0);
+                ui.label("Queue — links or playlist URLs, one per \
+                          line:");
+                ui.add(egui::TextEdit::multiline(&mut self.queue)
+                    .desired_rows(3)
+                    .desired_width(f32::INFINITY)
+                    .hint_text(
+                        "https://youtube.com/playlist?list=…\n\
+                         https://youtu.be/…"));
+
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("Find songs:");
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.search)
+                            .desired_width(330.0)
+                            .hint_text("artist title…"));
+                    let go = resp.lost_focus()
+                        && ui.input(|i| i.key_pressed(
+                            egui::Key::Enter));
+                    if (ui.button("Search").clicked() || go)
+                        && !self.search.trim().is_empty()
+                    {
+                        self.hits.clear();
+                        self.start(Job::Search);
+                    }
+                    let any = self.hits.iter().any(|h| h.3);
+                    if ui.add_enabled(any,
+                            egui::Button::new("Queue checked"))
+                        .clicked()
+                    {
+                        for h in self.hits.iter().filter(|h| h.3) {
+                            self.queue.push_str(&h.0);
+                            self.queue.push('\n');
+                        }
+                        self.hits.retain(|h| !h.3);
+                    }
+                });
+                if !self.hits.is_empty() {
+                    egui::ScrollArea::vertical()
+                        .max_height(120.0)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            for h in &mut self.hits {
+                                ui.horizontal(|ui| {
+                                    let cb = egui::Checkbox::new(
+                                        &mut h.3, &h.1);
+                                    if h.2 {
+                                        ui.add_enabled(false, cb)
+                                            .on_hover_text(
+                                                "already in the \
+                                                 library");
+                                    } else {
+                                        ui.add(cb);
+                                    }
+                                });
+                            }
+                        });
+                }
             });
 
             ui.add_space(8.0);
@@ -244,6 +341,19 @@ impl eframe::App for PrepApp {
                     .clicked()
                 {
                     self.start(Job::Prep);
+                }
+                let queue_ok = !self.library.trim().is_empty()
+                    && self.queue.lines()
+                        .any(|l| !l.trim().is_empty());
+                if ui
+                    .add_enabled(can_act && queue_ok,
+                                 egui::Button::new("Prepare queue"))
+                    .on_hover_text(
+                        "process every link in the queue box — \
+                         playlist URLs expand to all their videos")
+                    .clicked()
+                {
+                    self.start(Job::Queue);
                 }
                 let batch_ok = !self.library.trim().is_empty();
                 if ui
