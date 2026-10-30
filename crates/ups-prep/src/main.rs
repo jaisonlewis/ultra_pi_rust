@@ -60,6 +60,9 @@ struct Args {
     no_separate: bool,
     /// encode .inst.mp4 as HEVC — the Pi 5 decodes it in hardware
     hevc: bool,
+    /// yt-dlp cookies: a browser name (firefox/chrome/edge) or a
+    /// cookies.txt path — signed-in sessions dodge the bot-check
+    cookies: Option<String>,
     /// `batch` mode — regenerate charts across a whole library.
     batch: bool,
     /// `models` mode — download the model/binary pack into --models.
@@ -82,6 +85,7 @@ impl Args {
             guide: self.guide,
             no_separate: self.no_separate,
             hevc: self.hevc,
+            cookies: self.cookies.clone(),
             batch: self.batch,
             dl_models: self.dl_models,
             gui: self.gui,
@@ -103,6 +107,8 @@ fn parse_args() -> Result<Args> {
         guide: 0.15,
         no_separate: false,
         hevc: false,
+        cookies: std::env::var("UPS_YTDLP_COOKIES").ok()
+            .filter(|s| !s.is_empty()),
         batch: false,
         dl_models: false,
         gui: false,
@@ -120,6 +126,8 @@ fn parse_args() -> Result<Args> {
             "--guide" => args.guide = a.next().context("--guide")?.parse()?,
             "--no-separate" => args.no_separate = true,
             "--hevc" => args.hevc = true,
+            "--cookies" => args.cookies =
+                Some(a.next().context("--cookies")?),
             "-h" | "--help" => {
                 println!(
                     "ups-prep <youtube-url | playlist-url | media-file> \
@@ -138,7 +146,13 @@ fn parse_args() -> Result<Args> {
                      \x20 --no-separate    skip vocal separation\n\
                      \x20 --hevc           encode .inst.mp4 as HEVC —\n\
                      \x20                  hw-decoded on the Pi 5\n\
+                     \x20 --cookies SRC    yt-dlp cookies: a browser\n\
+                     \x20                  name (firefox) or cookies.txt\n\
+                     \x20                  (env UPS_YTDLP_COOKIES)\n\
                      \x20 --gui            open the prep window\n\n\
+                     blocked downloads retry with backoff\n\
+                     (UPS_YTDLP_RETRIES, default 4); playlist items are\n\
+                     paced UPS_YTDLP_DELAY seconds apart (default 4).\n\n\
                      a playlist url expands to every video in it;\n\
                      artist/title/chart overrides only apply when a\n\
                      single song is being prepared.\n\n\
@@ -166,21 +180,57 @@ fn stage(label: &str) {
     say!("==> {label}");
 }
 
+/// Run yt-dlp with the args' cookie source and retry transient
+/// YouTube blocks ("Sign in to confirm…", HTTP 429) with backoff —
+/// YouTube lifts the check on its own clock, not ours.
+fn ytdlp(args: &Args, extra: &[String], url: &str)
+        -> Result<std::process::Output> {
+    let mut argv: Vec<String> = vec![
+        "--extractor-args".into(),
+        "youtube:player_client=android".into(),
+    ];
+    if let Some(c) = &args.cookies {
+        if c.ends_with(".txt") || c.contains(['/', '\\']) {
+            argv.extend(["--cookies".into(), c.clone()]);
+        } else {
+            argv.extend(["--cookies-from-browser".into(), c.clone()]);
+        }
+    }
+    argv.extend(extra.iter().cloned());
+    let retries: u32 = std::env::var("UPS_YTDLP_RETRIES").ok()
+        .and_then(|v| v.parse().ok()).unwrap_or(4);
+    let mut attempt = 0u32;
+    loop {
+        let out = Command::new("yt-dlp")
+            .args(&argv).arg(url)
+            .output()
+            .context("spawn yt-dlp")?;
+        let err = String::from_utf8_lossy(&out.stderr);
+        let blocked = err.contains("Sign in to confirm")
+            || err.contains("429")
+            || err.contains("Too Many Requests");
+        if out.status.success() || !blocked || attempt == retries {
+            return Ok(out);
+        }
+        attempt += 1;
+        let wait = 30u64 << attempt; // 60,120,240,480s
+        say!("yt-dlp blocked ({}) — retry {}/{} in {}s",
+            err.lines().last().unwrap_or("?").trim(),
+            attempt, retries, wait);
+        std::thread::sleep(std::time::Duration::from_secs(wait));
+    }
+}
+
 /// When `src` is a playlist URL, return the member video urls;
 /// otherwise a one-element vec holding `src` itself (single video or
 /// local file). Flat metadata only — no downloads.
-fn expand_source(src: &str) -> Result<Vec<String>> {
+fn expand_source(args: &Args, src: &str) -> Result<Vec<String>> {
     if !src.contains("://") && !src.starts_with("www.") {
         return Ok(vec![src.to_string()]);
     }
-    let out = Command::new("yt-dlp")
-        .args([
-            "--extractor-args", "youtube:player_client=android",
-            "--flat-playlist", "--no-warnings", "-J",
-        ])
-        .arg(src)
-        .output()
-        .context("spawn yt-dlp")?;
+    let out = ytdlp(args, &[
+        "--flat-playlist".into(), "--no-warnings".into(), "-J".into(),
+    ], src)?;
     if !out.status.success() {
         bail!("yt-dlp: {}", String::from_utf8_lossy(&out.stderr)
             .lines().last().unwrap_or("failed"));
@@ -210,16 +260,12 @@ fn expand_source(src: &str) -> Result<Vec<String>> {
 
 /// YouTube search → (watch-url, "title — channel") pairs via yt-dlp
 /// `ytsearch`. Flat metadata only — the GUI lists them for picking.
-fn yt_search(query: &str, n: usize) -> Result<Vec<(String, String)>> {
+fn yt_search(args: &Args, query: &str, n: usize)
+        -> Result<Vec<(String, String)>> {
     let spec = format!("ytsearch{n}:{query}");
-    let out = Command::new("yt-dlp")
-        .args([
-            "--extractor-args", "youtube:player_client=android",
-            "--flat-playlist", "--no-warnings", "-J",
-        ])
-        .arg(&spec)
-        .output()
-        .context("spawn yt-dlp")?;
+    let out = ytdlp(args, &[
+        "--flat-playlist".into(), "--no-warnings".into(), "-J".into(),
+    ], &spec)?;
     if !out.status.success() {
         bail!("yt-dlp: {}", String::from_utf8_lossy(&out.stderr)
             .lines().last().unwrap_or("failed"));
@@ -258,7 +304,7 @@ fn library_video_ids(
 fn prep_many(args: &Args, urls: &[String]) -> Result<()> {
     let mut expanded: Vec<String> = Vec::new();
     for u in urls {
-        match expand_source(u) {
+        match expand_source(args, u) {
             Ok(m) => expanded.extend(m),
             Err(e) => say!("expand {u}: {e:#}"),
         }
@@ -288,6 +334,16 @@ fn prep_many(args: &Args, urls: &[String]) -> Result<()> {
             Err(e) => {
                 say!("  failed: {e:#}");
                 failed += 1;
+            }
+        }
+        // pace requests — hammering YouTube is what trips the
+        // bot-check in the first place
+        if i + 1 < total {
+            let delay: u64 = std::env::var("UPS_YTDLP_DELAY").ok()
+                .and_then(|v| v.parse().ok()).unwrap_or(4);
+            if delay > 0 {
+                std::thread::sleep(
+                    std::time::Duration::from_secs(delay));
             }
         }
     }
@@ -324,16 +380,12 @@ fn fetch_media(args: &Args, dir: &Path) -> Result<MediaInfo> {
     }
     stage("downloading");
     let out_tmpl = dir.join("yt-%(id)s.%(ext)s");
-    let out = Command::new("yt-dlp")
-        .args([
-            "--extractor-args", "youtube:player_client=android",
-            "-f", "best[ext=mp4]/bestvideo[ext=mp4]+bestaudio/best",
-            "--print-json", "-o",
-        ])
-        .arg(&out_tmpl)
-        .arg(src)
-        .output()
-        .context("spawn yt-dlp")?;
+    let out = ytdlp(args, &[
+        "-f".into(),
+        "best[ext=mp4]/bestvideo[ext=mp4]+bestaudio/best".into(),
+        "--print-json".into(), "-o".into(),
+        out_tmpl.to_string_lossy().into_owned(),
+    ], src)?;
     if !out.status.success() {
         bail!("yt-dlp: {}", String::from_utf8_lossy(&out.stderr)
             .lines().last().unwrap_or("failed"));

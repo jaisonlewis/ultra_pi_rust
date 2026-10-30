@@ -96,6 +96,8 @@ impl PrepApp {
             guide: self.guide,
             no_separate: self.no_separate,
             hevc: self.hevc,
+            cookies: std::env::var("UPS_YTDLP_COOKIES").ok()
+                .filter(|s| !s.is_empty()),
             dl_models: false,
             batch,
             gui: false,
@@ -119,7 +121,8 @@ impl PrepApp {
                 Job::Prep => crate::prep_many(&args,
                                               &[args.source.clone()]),
                 Job::Queue => crate::prep_many(&args, &queue_urls),
-                Job::Search => crate::yt_search(&query, 15).map(|hits| {
+                Job::Search => crate::yt_search(&args, &query, 15)
+                    .map(|hits| {
                     let have = if args.library.as_os_str().is_empty() {
                         Default::default()
                     } else {
