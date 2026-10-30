@@ -146,9 +146,12 @@ impl PrepApp {
     }
 
     fn field(ui: &mut egui::Ui, label: &str, s: &mut String,
+             hint: &str,
              browse: Option<fn() -> Option<PathBuf>>) {
-        ui.label(label);
-        ui.add(egui::TextEdit::singleline(s).desired_width(430.0));
+        ui.label(label).on_hover_text(hint);
+        ui.add(egui::TextEdit::singleline(s).desired_width(430.0)
+            .hint_text(hint))
+            .on_hover_text(hint);
         if let Some(pick) = browse {
             if ui.button("Browse…").clicked() {
                 if let Some(p) = pick() {
@@ -229,6 +232,9 @@ impl eframe::App for PrepApp {
                     .spacing([8.0, 6.0])
                     .show(ui, |ui| {
                         Self::field(ui, "Song", &mut self.source,
+                            "YouTube link, playlist URL, or a local \
+                             media file — 'Prepare song' runs the \
+                             full pipeline on it",
                             Some(|| {
                                 rfd::FileDialog::new()
                                     .add_filter("media", &[
@@ -238,31 +244,49 @@ impl eframe::App for PrepApp {
                                     .pick_file()
                             }));
                         Self::field(ui, "Library", &mut self.library,
+                            "destination root for prepared songs — \
+                             the folder tree that syncs to the \
+                             pendrive (e.g. station-out)",
                             Some(|| {
                                 rfd::FileDialog::new().pick_folder()
                             }));
                         Self::field(ui, "Models", &mut self.models,
+                            "AI model pack dir (spleeter, parakeet, \
+                             rmvpe) — 'Download models' fills it",
                             Some(|| {
                                 rfd::FileDialog::new().pick_folder()
                             }));
                         Self::field(ui, "Artist (opt.)",
-                                    &mut self.artist, None);
+                                    &mut self.artist,
+                            "override the artist name — YouTube \
+                             metadata fills this in automatically",
+                            None);
                         Self::field(ui, "Title (opt.)",
-                                    &mut self.title, None);
+                                    &mut self.title,
+                            "override the song title — YouTube \
+                             metadata fills this in automatically",
+                            None);
                         Self::field(ui, "Chart (opt.)",
                                     &mut self.chart,
+                            "import a hand-made .txt/.upsong chart \
+                             instead of generating one from ASR+pitch",
                             Some(|| {
                                 rfd::FileDialog::new()
                                     .add_filter("chart",
                                                 &["txt", "upsong"])
                                     .pick_file()
                             }));
-                        ui.label("Guide vocal");
+                        ui.label("Guide vocal").on_hover_text(
+                            "how loud the vocals stay in the karaoke \
+                             track — 0 = pure instrumental");
                         ui.add(egui::Slider::new(&mut self.guide,
                             0.0..=0.5)
                             .text("level"));
                         ui.checkbox(&mut self.no_separate,
-                                    "skip vocal separation");
+                                    "skip vocal separation")
+                            .on_hover_text(
+                                "no spleeter pass — no karaoke track \
+                                 or vocal stem (chart still gets made)");
                         ui.checkbox(&mut self.hevc,
                                     "HEVC karaoke video")
                             .on_hover_text(
@@ -273,7 +297,12 @@ impl eframe::App for PrepApp {
 
                 ui.add_space(4.0);
                 ui.label("Queue — links or playlist URLs, one per \
-                          line:");
+                          line:")
+                    .on_hover_text(
+                        "each line is one source: a YouTube video, a \
+                         playlist URL (expands to every video), or a \
+                         local file path — 'Prepare queue' runs them \
+                         in order and keeps going past failures");
                 ui.add(egui::TextEdit::multiline(&mut self.queue)
                     .desired_rows(3)
                     .desired_width(f32::INFINITY)
@@ -283,15 +312,23 @@ impl eframe::App for PrepApp {
 
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    ui.label("Find songs:");
+                    ui.label("Find songs:").on_hover_text(
+                        "search YouTube without leaving the window — \
+                         check the results you want and 'Queue \
+                         checked' adds their links to the queue box");
                     let resp = ui.add(
                         egui::TextEdit::singleline(&mut self.search)
                             .desired_width(330.0)
-                            .hint_text("artist title…"));
+                            .hint_text("artist title…"))
+                        .on_hover_text(
+                            "e.g. 'fleetwood mac dreams' — Enter \
+                             searches too");
                     let go = resp.lost_focus()
                         && ui.input(|i| i.key_pressed(
                             egui::Key::Enter));
-                    if (ui.button("Search").clicked() || go)
+                    if (ui.button("Search")
+                            .on_hover_text("search YouTube")
+                            .clicked() || go)
                         && !self.search.trim().is_empty()
                     {
                         self.hits.clear();
@@ -300,6 +337,9 @@ impl eframe::App for PrepApp {
                     let any = self.hits.iter().any(|h| h.3);
                     if ui.add_enabled(any,
                             egui::Button::new("Queue checked"))
+                        .on_hover_text(
+                            "append the ticked results to the queue \
+                             box above")
                         .clicked()
                     {
                         for h in self.hits.iter().filter(|h| h.3) {
