@@ -213,7 +213,10 @@ struct Persisted {
 }
 
 pub struct State {
-    pub root: PathBuf,
+    root: RwLock<PathBuf>,
+    /// the --root arg (or cwd) as passed — re-resolved each rescan so
+    /// a newly-mounted stick can take over mid-run
+    explicit_root: PathBuf,
     pub host_key: String,
     pub build_v: String,
     pub difficulty: i64,
@@ -248,15 +251,17 @@ impl State {
     pub fn new(root: PathBuf, host_key: String, build_v: String,
                difficulty: i64, vocal_cut: bool, intermission_sec: f64,
                state_path: PathBuf) -> Self {
+        let resolved = catalog::resolve_root(&root);
         let entries = RwLock::new(
-            catalog::scan(&root)
+            catalog::scan(&resolved)
                 .iter()
                 .enumerate()
                 .map(|(i, s)| entry_of(s, (i + 1) as i64))
                 .collect::<Vec<_>>(),
         );
         let mut st = State {
-            root,
+            root: RwLock::new(resolved),
+            explicit_root: root,
             host_key,
             build_v,
             difficulty,
@@ -328,12 +333,36 @@ impl State {
         }
     }
 
+    /// The effective media root (may point at a USB stick).
+    pub fn root(&self) -> PathBuf {
+        self.root.read().unwrap().clone()
+    }
+
+    /// Re-check whether a better media root appeared — a stick
+    /// mounted since boot, or the current root's mount pulled. The
+    /// same resolution rule as startup: `ultrapistar/` descend,
+    /// discovered stick wins, explicit --root is the fallback.
+    /// Swaps `root` when the answer changes; callers rescan after.
+    pub fn refresh_root(&self) -> bool {
+        let next = catalog::resolve_root(&self.explicit_root);
+        let mut root = self.root.write().unwrap();
+        if next != *root {
+            eprintln!("media root: {} -> {}", root.display(),
+                      next.display());
+            *root = next;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Re-walk the media root and merge changes in place — new song
     /// folders appear, removed ones drop, and songs that gained an
     /// inst/chart/art sidecar upgrade without losing their entry id
     /// (so the queue keeps pointing at the right song).
     pub fn rescan(&self) -> Rescan {
-        let songs = catalog::scan(&self.root);
+        self.refresh_root();
+        let songs = catalog::scan(&self.root());
         let mut entries = self.entries.write().unwrap();
         let mut r = Rescan {
             total: songs.len(),
@@ -618,6 +647,8 @@ impl State {
             "now_playing": playing.map(|i| self.item_row(i)),
             "queue": queued,
             "queue_count": queued.len() + playing.is_some() as usize,
+            "song_count": self.entries.read().unwrap().len(),
+            "library_root": self.root().to_string_lossy(),
         })
     }
 

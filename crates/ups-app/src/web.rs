@@ -775,6 +775,7 @@ async fn api_catalog_rescan(AxState(app): AxState<Arc<App>>,
         "updated": r.updated,
         "charts_added": r.upgraded,
         "songs": r.total,
+        "root": app.st.root(),
     }))
     .into_response()
 }
@@ -1204,7 +1205,7 @@ async fn api_manage_songs(AxState(app): AxState<Arc<App>>)
         .iter()
         .map(|e| {
             let dir = e.media.parent().map(|p| p.to_path_buf())
-                .unwrap_or_else(|| app.st.root.clone());
+                .unwrap_or_else(|| app.st.root());
             let stem = e.media.file_stem()
                 .unwrap_or_default().to_string_lossy().to_string();
             let size = std::fs::metadata(&e.media)
@@ -1379,7 +1380,7 @@ async fn api_manage_entry_repair(
                 .map(|_| PathBuf::from("ups-prep"))
         });
     if let Some(bin) = prep {
-        let root = app.st.root.clone();
+        let root = app.st.root();
         std::thread::spawn(move || {
             let _ = std::process::Command::new(bin)
                 .arg(&media)
@@ -1430,7 +1431,7 @@ fn pending_charts(app: &App) -> Vec<Value> {
     }
     let mut files = Vec::new();
     for d in ["chart-library", "charts"] {
-        walk(&app.st.root.join(d), &mut files, 0);
+        walk(&app.st.root().join(d), &mut files, 0);
     }
     let entries = app.st.entries.read().unwrap().clone();
     files
@@ -1632,7 +1633,7 @@ async fn api_upload(AxState(app): AxState<Arc<App>>,
     );
     // one "Artist - Title" folder per upload — the catalog's folder
     // convention gives rescan the right display names
-    let dir = app.st.root.join(format!(
+    let dir = app.st.root().join(format!(
         "{} - {}",
         sanitize_stem(&artist),
         sanitize_stem(&title)

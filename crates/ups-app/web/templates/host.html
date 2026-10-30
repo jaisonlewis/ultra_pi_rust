@@ -38,6 +38,15 @@
 </section>
 
 <section class="card">
+  <h2>Library <span id="song-count" class="muted"></span></h2>
+  <p class="muted" id="library-root" title="The folder being scanned — a
+    USB stick carrying ultrapistar/ or .upsmedia wins automatically">—</p>
+  <button id="btn-rescan-library"
+          title="Re-walk the media root — new folders, dropped folders and
+    sidecar upgrades all apply live. Also picks up a newly-mounted stick.">Rescan library</button>
+</section>
+
+<section class="card">
   <h2>Queue <span id="queue-count" class="muted"></span></h2>
   <ol id="host-queue" class="queue-list host-queue"></ol>
   <button id="btn-clear" class="danger">Clear queue</button>

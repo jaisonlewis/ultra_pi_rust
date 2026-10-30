@@ -2,6 +2,7 @@
    Session already carries host auth (set via /host?key=). */
 
 function render(state) {
+  renderLibrary(state);
   const now = $("#now-card");
   if (state.now_playing) {
     const it = state.now_playing;
@@ -325,5 +326,23 @@ $("#btn-rescan").addEventListener("click", async () => {
     loadPendingCharts();
   } catch (e) { toast(e.message, "error"); }
 });
+
+$("#btn-rescan-library").addEventListener("click", async () => {
+  try {
+    const r = await api("/api/catalog/rescan", "POST");
+    toast(`Library: ${r.songs} songs ` +
+          `(+${r.added} −${r.removed} ~${r.updated})`);
+    loadPendingCharts();
+  } catch (e) { toast(e.message, "error"); }
+});
+
+function renderLibrary(s) {
+  if (s.song_count !== undefined) {
+    $("#song-count").textContent = `· ${s.song_count} songs`;
+  }
+  if (s.library_root) {
+    $("#library-root").textContent = s.library_root;
+  }
+}
 
 loadPendingCharts();

@@ -186,30 +186,41 @@ fn find_art(dir: &Path, media_stem: &str) -> Option<PathBuf> {
     None
 }
 
-fn find_charts_rec(dir: &Path, want: &str, depth: u32) -> Option<PathBuf> {
+/// Every `.upsong` under the root, indexed once per scan by stem and
+/// by parent folder name. The old code re-walked the whole tree per
+/// chart-less song — O(songs × dirs) — which turned a multi-thousand
+/// song library rescan into minutes of grind on the Pi's USB mount.
+#[derive(Default)]
+pub struct ChartIndex {
+    by_stem: std::collections::HashMap<String, PathBuf>,
+}
+
+fn index_charts_rec(dir: &Path, depth: u32, ix: &mut ChartIndex) {
     if depth > 4 {
-        return None;
+        return;
     }
     for p in list_dir(dir, false) {
-        if p.extension().map(|e| e == "upsong").unwrap_or(false)
-            && stem_of(&file_name(&p)) == want
-        {
-            return Some(p);
+        if p.extension().map(|e| e == "upsong").unwrap_or(false) {
+            let st = stem_of(&file_name(&p)).to_string();
+            ix.by_stem.entry(st).or_insert_with(|| p.clone());
         }
     }
     for p in list_dir(dir, true) {
-        if let Some(found) = find_charts_rec(&p, want, depth + 1) {
-            return Some(found);
-        }
+        index_charts_rec(&p, depth + 1, ix);
     }
-    None
+}
+
+pub fn chart_index(root: &Path) -> ChartIndex {
+    let mut ix = ChartIndex::default();
+    index_charts_rec(root, 0, &mut ix);
+    ix
 }
 
 /// Chart resolution, mirroring the Switch's `findChart` plus the
 /// manifest-declared path and the `charts/<Artist - Title>.upsong`
 /// convention the prepared-stick layout uses.
 fn find_chart(root: &Path, dir: &Path, media_stem: &str,
-              folder_name: &str) -> Option<PathBuf> {
+              folder_name: &str, ix: &ChartIndex) -> Option<PathBuf> {
     let p = dir.join(format!("{media_stem}.upsong"));
     if p.is_file() {
         return Some(p);
@@ -225,9 +236,11 @@ fn find_chart(root: &Path, dir: &Path, media_stem: &str,
     if p.is_file() {
         return Some(p);
     }
-    // recursive hunt under the root (charts/, chart-library/)
-    find_charts_rec(root, media_stem, 0)
-        .or_else(|| find_charts_rec(root, folder_name, 0))
+    // anywhere under the root (charts/, chart-library/, nested dirs)
+    ix.by_stem
+        .get(media_stem)
+        .cloned()
+        .or_else(|| ix.by_stem.get(folder_name).cloned())
 }
 
 /// `Artist - Title` folder name → (artist, title). A name without the
@@ -278,7 +291,8 @@ pub fn read_manifest(root: &Path) -> Vec<SongRec> {
 
 /// Resolve one manifest record to on-disk paths. Returns None when no
 /// media file can be found anywhere the record points.
-fn resolve_rec(root: &Path, rec: &SongRec) -> Option<Song> {
+fn resolve_rec(root: &Path, rec: &SongRec,
+               ix: &ChartIndex) -> Option<Song> {
     if rec.local_path.is_empty() {
         return None;
     }
@@ -372,7 +386,7 @@ fn resolve_rec(root: &Path, rec: &SongRec) -> Option<Song> {
         }
     };
     if chart.is_none() {
-        chart = find_chart(root, &dir, &want_stem, &folder_name);
+        chart = find_chart(root, &dir, &want_stem, &folder_name, ix);
     }
 
     let art = if rec.art.is_empty() {
@@ -401,6 +415,7 @@ fn resolve_rec(root: &Path, rec: &SongRec) -> Option<Song> {
 /// (prepared sticks), `artist/title/` two-level (station output) and
 /// flat root files all resolve — the same set the Switch scans.
 pub fn scan_folders(root: &Path) -> Vec<Song> {
+    let ix = chart_index(root);
     let mut out = Vec::new();
     let song = |dir: PathBuf, artist: String, title: String| {
         let (media, inst) = pick_media(&dir, "")?;
@@ -417,7 +432,7 @@ pub fn scan_folders(root: &Path) -> Vec<Song> {
                 "local".into()
             },
             source_id: mstem.strip_prefix("yt-").unwrap_or(&mstem).into(),
-            chart: find_chart(root, &dir, &mstem, &folder),
+            chart: find_chart(root, &dir, &mstem, &folder, &ix),
             art: find_art(&dir, &mstem),
             artist,
             title,
@@ -481,12 +496,158 @@ pub fn scan_folders(root: &Path) -> Vec<Song> {
                 let i = root.join(format!("{st}.inst.mp4"));
                 if i.is_file() { Some(i) } else { None }
             },
-            chart: find_chart(root, root, &st, &st),
+            chart: find_chart(root, root, &st, &st, &ix),
             art: find_art(root, &st),
             duration_sec: None,
         });
     }
     out
+}
+
+/// Does `dir` hold song content? Bounded checks only — a manifest,
+/// a media file at the top, or a subdir that contains one. Keeps
+/// discovery from mistaking a source checkout's `ultrapistar/`
+/// package dir (or any same-named folder) for a real library.
+fn looks_like_library(dir: &Path) -> bool {
+    if dir.join("manifest.json").is_file() {
+        return true;
+    }
+    for p in list_dir(dir, false).into_iter().take(64) {
+        if is_source_media(&p) {
+            return true;
+        }
+    }
+    for d in list_dir(dir, true).into_iter().take(48) {
+        for p in list_dir(&d, false).into_iter().take(48) {
+            if is_source_media(&p) {
+                return true;
+            }
+        }
+        // song dirs nest one deeper in the two-level layout
+        for dd in list_dir(&d, true).into_iter().take(16) {
+            for p in list_dir(&dd, false).into_iter().take(48) {
+                if is_source_media(&p) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// A mounted volume qualifies as a media stick when it carries a
+/// `ultrapistar/` dir holding song content (the prepared-stick
+/// convention) or an `.upsmedia` marker file — the same rule the
+/// Python app uses, so a drive built for one appliance works on all
+/// of them. Returns the directory to treat as the song root.
+pub fn stick_root(mount: &Path) -> Option<PathBuf> {
+    let inner = mount.join("ultrapistar");
+    if inner.is_dir() && looks_like_library(&inner) {
+        return Some(inner);
+    }
+    if mount.join(".upsmedia").exists() {
+        return Some(mount.to_path_buf());
+    }
+    None
+}
+
+/// Directories that may hold removable media mounts on this platform.
+/// UPS_MEDIA_DIRS adds/extends (colon/semicolon-separated list).
+fn mount_bases() -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = Vec::new();
+    if let Ok(extra) = std::env::var("UPS_MEDIA_DIRS") {
+        for p in extra.split([':', ';']).filter(|s| !s.is_empty()) {
+            v.push(PathBuf::from(p));
+        }
+    }
+    #[cfg(unix)]
+    {
+        for b in ["/media", "/run/media", "/mnt", "/home"] {
+            v.push(PathBuf::from(b));
+        }
+    }
+    #[cfg(windows)]
+    {
+        for c in 'D'..='Z' {
+            let d = PathBuf::from(format!("{c}:\\"));
+            if d.exists() {
+                v.push(d);
+            }
+        }
+    }
+    v
+}
+
+/// Find a media stick on any mounted volume: `/media/<u>/<label>`,
+/// `/run/media/<u>/<label>`, `/mnt/<label>`, `D:\` … — and for
+/// user-level dirs one more level down (`/media/jaison/STICK`).
+/// Returns the song root (the mount's `ultrapistar/` child or the
+/// mount itself when marker-only).
+pub fn find_stick() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("UPS_MEDIA_DIR") {
+        if !p.is_empty() {
+            let p = PathBuf::from(p);
+            return Some(stick_root(&p).unwrap_or(p));
+        }
+    }
+    let mut mounts: Vec<PathBuf> = Vec::new();
+    for base in mount_bases() {
+        if let Some(p) = stick_root(&base) {
+            return Some(p);
+        }
+        let Ok(rd) = std::fs::read_dir(&base) else { continue };
+        for e in rd.flatten() {
+            let p = e.path();
+            if !p.is_dir()
+                || p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with('.'))
+                    .unwrap_or(true)
+            {
+                continue;
+            }
+            mounts.push(p);
+        }
+    }
+    // one level down — /media/<user>/<label>, /run/media/<user>/<label>
+    for m in mounts.iter().cloned().collect::<Vec<_>>() {
+        if let Some(p) = stick_root(&m) {
+            return Some(p);
+        }
+        if let Ok(rd) = std::fs::read_dir(&m) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    if let Some(s) = stick_root(&p) {
+                        return Some(s);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Resolve the effective media root, in order:
+///   1. `--root` aimed at a mountpoint descends into its `ultrapistar/`
+///   2. a discovered stick on any mounted volume — the Python app's
+///      "stick becomes the root" rule, so a plugged-in drive IS the
+///      library on every appliance
+///   3. `--root` verbatim — the static fallback when no stick is found
+///      (UPS_NO_USB=1 skips discovery, making it fully authoritative)
+pub fn resolve_root(explicit: &Path) -> PathBuf {
+    if let Some(inner) = stick_root(explicit) {
+        return inner;
+    }
+    let no_usb = std::env::var("UPS_NO_USB")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    if !no_usb {
+        if let Some(stick) = find_stick() {
+            return stick;
+        }
+    }
+    explicit.to_path_buf()
 }
 
 /// Manifest records plus any folders the manifest doesn't know about —
@@ -499,8 +660,9 @@ pub fn scan(root: &Path) -> Vec<Song> {
     if recs.is_empty() {
         return scan_folders(root);
     }
+    let ix = chart_index(root);
     let mut songs: Vec<Song> =
-        recs.iter().filter_map(|r| resolve_rec(root, r)).collect();
+        recs.iter().filter_map(|r| resolve_rec(root, r, &ix)).collect();
     if songs.is_empty() {
         return scan_folders(root);
     }

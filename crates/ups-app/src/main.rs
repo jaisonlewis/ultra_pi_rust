@@ -108,9 +108,10 @@ fn main() {
         env!("CARGO_PKG_VERSION"),
         crate::state::now_secs() as u64 % 1_000_000
     );
-    let state_path = root.join("ups-state.json");
+    let resolved_root = ups_core::catalog::resolve_root(&root);
+    let state_path = resolved_root.join("ups-state.json");
     let st = State::new(
-        root.clone(),
+        root,
         host_key(),
         build_v,
         difficulty.clamp(0, 2),
@@ -121,7 +122,7 @@ fn main() {
     eprintln!(
         "ups-app: {} songs under {}",
         st.entries.read().unwrap().len(),
-        root.display()
+        st.root().display()
     );
     eprintln!("ups-app: host key {}", st.host_key);
     eprintln!("ups-app: join url {}/", lan_addr(port));
