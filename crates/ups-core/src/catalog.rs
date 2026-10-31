@@ -652,8 +652,14 @@ pub fn resolve_roots(explicit: &Path) -> Vec<PathBuf> {
         roots.push(explicit);
     } else {
         roots.extend(find_sticks());
-        if !roots.contains(&explicit) {
-            roots.push(explicit);
+        // the explicit root joins the union only when it carries song
+        // content — a bare cwd (e.g. `ups-app --tv` from the repo dir)
+        // must not drag the whole working tree into the scan. With no
+        // sticks at all it stays as the fallback/write target.
+        if roots.is_empty() || looks_like_library(&explicit) {
+            if !roots.contains(&explicit) {
+                roots.push(explicit);
+            }
         }
     }
     roots
