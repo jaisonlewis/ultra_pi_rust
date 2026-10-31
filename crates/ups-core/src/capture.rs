@@ -73,6 +73,9 @@ impl MicCapture {
             }
             let shared = Arc::new(Mutex::new(VecDeque::<i16>::new()));
             let cfg_stream: cpal::StreamConfig = cfg.clone().into();
+            // mono downmix — interleaved frames would pitch-shift the
+            // detector and double every sample-count heuristic
+            let ch = cfg.channels().max(1) as usize;
             let err_fn = |e: cpal::StreamError| eprintln!("mic error: {e}");
             let stream = match cfg.sample_format() {
                 cpal::SampleFormat::I16 => {
@@ -81,7 +84,7 @@ impl MicCapture {
                         &cfg_stream,
                         move |data: &[i16], _: &cpal::InputCallbackInfo| {
                             let mut g = buf.lock().unwrap();
-                            g.extend(data.iter().copied());
+                            g.extend(data.chunks(ch).map(|f| f[0]));
                             while g.len() > 8192 {
                                 g.pop_front();
                             }
@@ -96,8 +99,8 @@ impl MicCapture {
                         &cfg_stream,
                         move |data: &[f32], _: &cpal::InputCallbackInfo| {
                             let mut g = buf.lock().unwrap();
-                            g.extend(data.iter().map(|&s| {
-                                (s.clamp(-1.0, 1.0) * 32767.0) as i16
+                            g.extend(data.chunks(ch).map(|f| {
+                                (f[0].clamp(-1.0, 1.0) * 32767.0) as i16
                             }));
                             while g.len() > 8192 {
                                 g.pop_front();

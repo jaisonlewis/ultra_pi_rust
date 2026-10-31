@@ -229,12 +229,13 @@ pub fn calibrate() -> Result<f64, String> {
         if stream.play().is_err() {
             continue;
         }
-        opened = Some((stream, shared, rate, name));
+        let ch = cfg.channels().max(1) as usize;
+        opened = Some((stream, shared, rate, name, ch));
         break;
     }
-    let (_cap, shared, sr, dev_name) = opened
+    let (_cap, shared, sr, dev_name, ch) = opened
         .ok_or_else(|| "no capture device".to_string())?;
-    eprintln!("mic-cal: capturing on {dev_name} @ {sr} Hz");
+    eprintln!("mic-cal: capturing on {dev_name} @ {sr} Hz x{ch}");
 
     // click pattern in the capture's own rate — the acoustic 1kHz is
     // what the mic hears either way, and correlating in one domain
@@ -271,9 +272,11 @@ pub fn calibrate() -> Result<f64, String> {
     let Some(&(t_end, _)) = chunks.last() else {
         return Err("mic captured nothing".into());
     };
-    let total: usize = chunks.iter().map(|(_, c)| c.len()).sum();
+    // downmix to mono — a multichannel node halves the click
+    // correlation and doubles every sample index otherwise
+    let total: usize = chunks.iter().map(|(_, c)| c.len() / ch).sum();
     let pcm: Vec<f32> = chunks.iter()
-        .flat_map(|(_, c)| c.iter().map(|&v| v as f32)).collect();
+        .flat_map(|(_, c)| c.chunks(ch).map(|f| f[0] as f32)).collect();
     // what did the mic actually hear — silence means the wrong device
     // (loopback/monitor node), nonzero noise floor means it's alive
     let rms = (pcm.iter().map(|&v| (v * v) as f64).sum::<f64>()
