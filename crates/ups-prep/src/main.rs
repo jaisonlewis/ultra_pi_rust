@@ -65,6 +65,10 @@ struct Args {
     cookies: Option<String>,
     /// `batch` mode — regenerate charts across a whole library.
     batch: bool,
+    /// parallel batch: process shard `shard` of `shards` (dir-name
+    /// hash partition) so N workers can split one library.
+    shard: u32,
+    shards: u32,
     /// `models` mode — download the model/binary pack into --models.
     dl_models: bool,
     /// open the native window instead of running the CLI pipeline
@@ -87,6 +91,8 @@ impl Args {
             hevc: self.hevc,
             cookies: self.cookies.clone(),
             batch: self.batch,
+            shard: self.shard,
+            shards: self.shards,
             dl_models: self.dl_models,
             gui: self.gui,
         }
@@ -110,6 +116,8 @@ fn parse_args() -> Result<Args> {
         cookies: std::env::var("UPS_YTDLP_COOKIES").ok()
             .filter(|s| !s.is_empty()),
         batch: false,
+        shard: 0,
+        shards: 1,
         dl_models: false,
         gui: false,
     };
@@ -128,6 +136,10 @@ fn parse_args() -> Result<Args> {
             "--hevc" => args.hevc = true,
             "--cookies" => args.cookies =
                 Some(a.next().context("--cookies")?),
+            "--shard" => args.shard =
+                a.next().context("--shard")?.parse()?,
+            "--shards" => args.shards =
+                a.next().context("--shards")?.parse()?,
             "-h" | "--help" => {
                 println!(
                     "ups-prep <youtube-url | playlist-url | media-file> \
@@ -627,7 +639,7 @@ fn prep(args: &Args) -> Result<()> {
         say!("chart: {n} notes → {}", dest.display());
     } else {
         gen_chart(&args, &media, &artist, &title, &asr_words,
-                  &stem_path("upsong"), rec.as_ref());
+                  &stem_path("upsong"), rec.as_ref(), None);
     }
 
     stage("fetching artwork");
@@ -764,7 +776,18 @@ fn pick_lyrics(recs: &[lyrics::LyricRecord],
 /// with the current ASR+pitch stack. Songs whose .upsong was imported
 /// (not marked ultrapibar-genchart/generated) are left alone.
 fn run_batch(args: &Args) -> Result<()> {
-    let songs = ups_core::catalog::scan(&args.library);
+    let mut songs = ups_core::catalog::scan(&args.library);
+    if args.shards > 1 {
+        // deterministic partition — same song always lands in the
+        // same shard regardless of scan order
+        let mut h = |s: &ups_core::catalog::Song| -> u32 {
+            use std::hash::{Hash, Hasher};
+            let mut x = std::collections::hash_map::DefaultHasher::new();
+            s.dir.hash(&mut x);
+            x.finish() as u32
+        };
+        songs.retain(|s| h(s) % args.shards == args.shard);
+    }
     let total = songs.len();
     let (mut redone, mut skipped, mut failed) = (0u32, 0u32, 0u32);
     for (i, song) in songs.iter().enumerate() {
@@ -895,7 +918,8 @@ fn batch_one(args: &Args, song: &ups_core::catalog::Song) -> Result<bool> {
     }
 
     Ok(gen_chart(args, &song.media, &artist, &title,
-                 &asr_words, &dest, rec.as_ref()))
+                 &asr_words, &dest, rec.as_ref(),
+                 read_cached_pitch(&ana_path)))
 }
 
 /// Cached transcript from `<stem>.analysis.json` when it was written
@@ -917,9 +941,29 @@ fn read_cached_asr(ana_path: &Path) -> Option<Vec<asr::AsrWord>> {
         }).collect();
     Some(words)
 }
+/// Cached rmvpe curve from `<stem>.analysis.json` — the sidecar
+/// already stores f0/conf/hop, so batch recharts skip the expensive
+/// pitch pass entirely.
+fn read_cached_pitch(ana_path: &Path) -> Option<rmvpe::Curve> {
+    let j: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(ana_path).ok()?).ok()?;
+    let p = &j["pitch"];
+    let f0: Vec<f32> = p["f0"].as_array()?.iter()
+        .filter_map(|v| v.as_f64().map(|x| x as f32)).collect();
+    let conf: Vec<f32> = p["conf"].as_array()?.iter()
+        .filter_map(|v| v.as_f64().map(|x| x as f32)).collect();
+    if f0.is_empty() || f0.len() != conf.len() {
+        return None;
+    }
+    let hop = p["hop_ms"].as_f64().unwrap_or(0.01);
+    let times = (0..f0.len()).map(|i| i as f64 * hop).collect();
+    Some(rmvpe::Curve { times, f0, conf })
+}
+
 fn gen_chart(args: &Args, media: &Path, artist: &str, title: &str,
              asr_words: &[asr::AsrWord], dest: &Path,
-             rec: Option<&lyrics::LyricRecord>) -> bool {
+             rec: Option<&lyrics::LyricRecord>,
+             cached_curve: Option<rmvpe::Curve>) -> bool {
     if asr_words.len() < 20 {
         say!("chart: too few asr words ({}) — need an imported \
                    chart or better audio", asr_words.len());
@@ -929,8 +973,12 @@ fn gen_chart(args: &Args, media: &Path, artist: &str, title: &str,
         &asr_words.iter()
             .map(|w| (w.word.clone(), w.start_ms, w.end_ms))
             .collect::<Vec<_>>());
-    // RMVPE curve on the 16k vocal stem (or raw 16k mono)
-    let curve = if rmvpe::have_model(&args.models) {
+    // RMVPE curve on the 16k vocal stem (or raw 16k mono);
+    // the batch path hands us the sidecar-cached curve instead
+    let curve = cached_curve.or_else(|| {
+        if !rmvpe::have_model(&args.models) {
+            return None;
+        }
         stage("extracting melody (rmvpe)");
         let audio16 = {
             let voc = media.with_extension("vocals.wav");
@@ -951,11 +999,14 @@ fn gen_chart(args: &Args, media: &Path, artist: &str, title: &str,
                              c.times.len(), voiced);
                 })
         })
-    } else {
+    }).or_else(|| {
+        if rmvpe::have_model(&args.models) {
+            return None; // already tried above
+        }
         say!("rmvpe.onnx not under {} — chart words get no pitch \
                    (all freestyle)", args.models.display());
         None
-    };
+    });
     let (synced, plain): (Vec<(i64, String)>, Vec<String>) =
         match rec {
             Some(r) => (r.synced.clone(), r.plain.clone()),
