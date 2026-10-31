@@ -13,6 +13,7 @@
 mod align;
 mod artwork;
 mod asr;
+mod ctcalign;
 mod ff;
 mod genchart;
 #[cfg(feature = "gui")]
@@ -20,6 +21,7 @@ mod gui;
 mod lyrics;
 mod mel;
 mod models;
+mod onset;
 mod rmvpe;
 mod separate;
 mod wordmap;
@@ -71,6 +73,9 @@ struct Args {
     shards: u32,
     /// `models` mode — download the model/binary pack into --models.
     dl_models: bool,
+    /// `align-diag <song-dir>` — forced-align fetched lyrics against
+    /// the vocal stem and print per-word timings (pipeline dev tool).
+    align_diag: bool,
     /// open the native window instead of running the CLI pipeline
     gui: bool,
 }
@@ -94,6 +99,7 @@ impl Args {
             shard: self.shard,
             shards: self.shards,
             dl_models: self.dl_models,
+            align_diag: self.align_diag,
             gui: self.gui,
         }
     }
@@ -119,12 +125,14 @@ fn parse_args() -> Result<Args> {
         shard: 0,
         shards: 1,
         dl_models: false,
+        align_diag: false,
         gui: false,
     };
     while let Some(arg) = a.next() {
         match arg.as_str() {
             "batch" => args.batch = true,
             "models" => args.dl_models = true,
+            "align-diag" => args.align_diag = true,
             "--gui" => args.gui = true,
             "--library" => args.library = a.next().context("--library")?.into(),
             "--models" => args.models = a.next().context("--models")?.into(),
@@ -465,7 +473,102 @@ fn main() -> Result<()> {
     if args.dl_models {
         return models::download(&args.models, None);
     }
+    if args.align_diag {
+        return run_align_diag(&args);
+    }
     prep_many(&args, &[args.source.clone()])
+}
+
+/// `ups-prep align-diag <song-dir> [--artist A --title T]` — fetch the
+/// best lyric record for the song, forced-align it to the vocal stem
+/// and dump per-word timings/confidence. The dev loop for the aligner.
+fn run_align_diag(args: &Args) -> Result<()> {
+    let dir = PathBuf::from(&args.source);
+    let songs = ups_core::catalog::scan(&dir);
+    let song = songs.first().context("no song under that dir")?;
+    // a bare song dir carries no artist/title — the chart header does
+    let hdr = song.chart.as_ref().map(|c| ups_core::chart::load_chart(c));
+    let hget = |k: &str| hdr.as_ref()
+        .and_then(|c| c.headers.get(k).cloned())
+        .filter(|v| !v.is_empty());
+    let artist = args.artist.clone()
+        .or_else(|| Some(song.artist.clone()).filter(|a| !a.is_empty()))
+        .or_else(|| hget("ARTIST")).unwrap_or_default();
+    let title = args.title.clone()
+        .or_else(|| Some(song.title.clone())
+                 .filter(|t| !t.is_empty() && !t.starts_with("yt-")))
+        .or_else(|| hget("TITLE")).unwrap_or_default();
+    let stem = song.media.file_stem().unwrap_or_default()
+        .to_string_lossy().into_owned();
+    let voc = song.dir.join(format!("{stem}.vocals.wav"));
+    let src = if voc.exists() && std::env::var("UPS_ALIGN_MIX").is_err() {
+        voc.clone()
+    } else {
+        song.media.clone()
+    };
+    say!("audio: {}", src.display());
+    let audio = ff::decode_f32(&src, ctcalign::SR as u32, 1)?;
+    let dur = Some(audio.len() as f64 / ctcalign::SR as f64);
+
+    // UPS_ALIGN_BACKEND=omni|parakeet overrides the language pick
+    let backend = match std::env::var("UPS_ALIGN_BACKEND").as_deref() {
+        Ok("omni") => ctcalign::Backend::Omnilingual,
+        Ok("parakeet") => ctcalign::Backend::ParakeetCtc,
+        _ => ctcalign::backend_for(&args.models, "")
+            .context("no aligner model installed")?,
+    };
+    let mut al = ctcalign::Aligner::load(&args.models, backend)?;
+    let t = std::time::Instant::now();
+    let lp = al.log_probs(&audio)?;
+    say!("ctc[{:?}]: {} frames @{}ms ({:.1}s audio) in {:.1}s",
+         backend, lp.frames, al.frame_ms,
+         audio.len() as f64 / ctcalign::SR as f64,
+         t.elapsed().as_secs_f64());
+
+    say!("song: {artist} — {title}");
+    let recs = collect_lyrics(&artist, &title, dur);
+    say!("lyrics: {} candidate records", recs.len());
+    let mut best: Option<(f32, usize, Vec<ctcalign::AlignedWord>, &lyrics::LyricRecord)> = None;
+    for r in &recs {
+        let lines: Vec<String> = if r.synced.is_empty() {
+            r.plain.clone()
+        } else {
+            r.synced.iter().map(|(_, t)| t.clone()).collect()
+        };
+        if lines.is_empty() { continue; }
+        let t = std::time::Instant::now();
+        let w = al.align(&lp, &lines);
+        let n_words: usize = lines.iter().map(|l| l.split_whitespace()
+            .filter(|w| w.chars().any(|c| c.is_alphanumeric())).count()).sum();
+        let heard = w.iter().filter(|x| x.conf >= ctcalign::MIN_WORD_CONF).count();
+        let mean_conf = if w.is_empty() { 0.0 } else {
+            w.iter().map(|x| x.conf).sum::<f32>() / w.len() as f32 };
+        let score = heard as f32 / n_words.max(1) as f32;
+        say!("  [{}] {} — {}: {} lines/{} words, heard {} ({:.0}%), mean conf {:.2}, dur {:?} ({:.1}s)",
+             r.source, r.artist_name, r.track_name, lines.len(), n_words,
+             heard, score * 100.0, mean_conf, r.duration.map(|d| d as i64),
+             t.elapsed().as_secs_f64());
+        if best.as_ref().is_none_or(|b| score > b.0) {
+            best = Some((score, n_words, w, r));
+        }
+    }
+    let Some((score, n_words, words, rec)) = best else {
+        bail!("no lyric record aligned");
+    };
+    say!("=== best: {} ({:.0}% of {} words heard) ===", rec.source,
+         score * 100.0, n_words);
+    let mut cur_line = usize::MAX;
+    for w in &words {
+        if w.line != cur_line {
+            cur_line = w.line;
+            println!();
+            print!("[{:>6.1}s] ", w.start_ms / 1000.0);
+        }
+        let mark = if w.conf < ctcalign::MIN_WORD_CONF { "?" } else { "" };
+        print!("{}{}({:.0}) ", mark, w.text, w.conf * 100.0);
+    }
+    println!();
+    Ok(())
 }
 
 /// The one-song pipeline: fetch → normalize → separate → karaoke →
@@ -639,7 +742,8 @@ fn prep(args: &Args) -> Result<()> {
         say!("chart: {n} notes → {}", dest.display());
     } else {
         gen_chart(&args, &media, &artist, &title, &asr_words,
-                  &stem_path("upsong"), rec.as_ref(), None);
+                  &stem_path("upsong"), &recs, rec.as_ref(),
+                  asr_lang.as_deref(), None);
     }
 
     stage("fetching artwork");
@@ -859,10 +963,12 @@ fn batch_one(args: &Args, song: &ups_core::catalog::Song) -> Result<bool> {
 
     // ASR — reuse the stored transcript when it's already a parakeet
     // pass; needle/empty/missing means re-transcribe
+    let mut asr_lang: Option<String> = None;
     let asr_words = read_cached_asr(&ana_path)
-        .filter(|w| w.len() >= 20)
-        .map(|w| {
+        .filter(|(w, _)| w.len() >= 20)
+        .map(|(w, l)| {
             say!("  asr: {} cached words", w.len());
+            asr_lang = l;
             w
         });
     let asr_words = match asr_words {
@@ -875,6 +981,7 @@ fn batch_one(args: &Args, song: &ups_core::catalog::Song) -> Result<bool> {
             let stem_ref = voc.exists().then_some(voc.as_path());
             let o = asr::transcribe_media(&song.media, stem_ref,
                                           &args.models)?;
+            asr_lang = o.lang.clone();
             let w = o.words;
             say!("  asr: {} words ({})", w.len(), o.engine);
             if w.len() < 20 {
@@ -917,14 +1024,36 @@ fn batch_one(args: &Args, song: &ups_core::catalog::Song) -> Result<bool> {
                  r.synced.len(), r.artist_name, r.track_name, r.source);
     }
 
-    Ok(gen_chart(args, &song.media, &artist, &title,
-                 &asr_words, &dest, rec.as_ref(),
-                 read_cached_pitch(&ana_path)))
+    let meta = gen_chart(args, &song.media, &artist, &title,
+                         &asr_words, &dest, &recs, rec.as_ref(),
+                         asr_lang.as_deref(),
+                         read_cached_pitch(&ana_path));
+    if let Some(m) = &meta {
+        // generation provenance for audits/ground-truth test runs
+        if let Ok(bytes) = std::fs::read(&ana_path) {
+            if let Ok(mut j) =
+                serde_json::from_slice::<serde_json::Value>(&bytes)
+            {
+                j["chart"]["gen"] = serde_json::json!({
+                    "lyrics_kind": m.lyrics_kind,
+                    "lines": m.lines,
+                    "words": m.words,
+                    "aligned": m.matched,
+                    "of": m.total,
+                });
+                let _ = std::fs::write(
+                    &ana_path, serde_json::to_string_pretty(&j)
+                        .unwrap_or_default());
+            }
+        }
+    }
+    Ok(meta.is_some())
 }
 
 /// Cached transcript from `<stem>.analysis.json` when it was written
 /// by a known ASR engine — avoids re-transcribing on every batch run.
-fn read_cached_asr(ana_path: &Path) -> Option<Vec<asr::AsrWord>> {
+fn read_cached_asr(ana_path: &Path)
+        -> Option<(Vec<asr::AsrWord>, Option<String>)> {
     let j: serde_json::Value =
         serde_json::from_slice(&std::fs::read(ana_path).ok()?).ok()?;
     let engine = j["asr"]["engine"].as_str().unwrap_or("");
@@ -939,7 +1068,8 @@ fn read_cached_asr(ana_path: &Path) -> Option<Vec<asr::AsrWord>> {
                 word: w[1].as_str()?.to_string(),
             })
         }).collect();
-    Some(words)
+    let lang = j["asr"]["lang"].as_str().map(str::to_string);
+    Some((words, lang))
 }
 /// Cached rmvpe curve from `<stem>.analysis.json` — the sidecar
 /// already stores f0/conf/hop, so batch recharts skip the expensive
@@ -960,36 +1090,139 @@ fn read_cached_pitch(ana_path: &Path) -> Option<rmvpe::Curve> {
     Some(rmvpe::Curve { times, f0, conf })
 }
 
-fn gen_chart(args: &Args, media: &Path, artist: &str, title: &str,
-             asr_words: &[asr::AsrWord], dest: &Path,
-             rec: Option<&lyrics::LyricRecord>,
-             cached_curve: Option<rmvpe::Curve>) -> bool {
-    if asr_words.len() < 20 {
-        say!("chart: too few asr words ({}) — need an imported \
-                   chart or better audio", asr_words.len());
+/// Lyric lines for the aligner: synced text wins, plain as backup.
+/// Section markers ([Chorus], {Verse}) and (x2) repeat tags are
+/// dropped so they never enter the token lattice as fake words.
+fn align_lines(r: &lyrics::LyricRecord) -> Vec<String> {
+    let raw: Vec<String> = if r.synced.is_empty() {
+        r.plain.clone()
+    } else {
+        r.synced.iter().map(|(_, t)| t.clone()).collect()
+    };
+    raw.into_iter().filter_map(|l| {
+        let keep: Vec<&str> = l.split_whitespace().filter(|w| {
+            if w.starts_with('[') || w.starts_with('{') {
+                return false;
+            }
+            let inner = w.trim_matches(|c: char| !c.is_alphanumeric());
+            let rep = inner.trim_start_matches(['x', 'X']);
+            if !inner.is_empty() && !rep.is_empty()
+                && rep.chars().all(|c| c.is_ascii_digit()) {
+                return false;
+            }
+            w.chars().any(|c| c.is_alphanumeric())
+        }).collect();
+        (!keep.is_empty()).then(|| keep.join(" "))
+    }).collect()
+}
+
+/// Forced-alignment chart: run CTC log-probs once, then every lyric
+/// candidate competes on the fraction of its words the model
+/// actually heard. Returns true when a chart was written.
+fn aligned_chart(args: &Args, audio16: &[f32], artist: &str,
+                 title: &str, recs: &[lyrics::LyricRecord],
+                 backend: ctcalign::Backend, curve: Option<&rmvpe::Curve>,
+                 dest: &Path, meta: &mut genchart::GenMeta) -> bool {
+    let mut al = match ctcalign::Aligner::load(&args.models, backend) {
+        Ok(a) => a,
+        Err(e) => {
+            say!("align: model load failed: {e}");
+            return false;
+        }
+    };
+    let lp = match al.log_probs(audio16) {
+        Ok(l) => l,
+        Err(e) => {
+            say!("align: inference failed: {e}");
+            return false;
+        }
+    };
+    let mut best: Option<(f32, Vec<ctcalign::AlignedWord>,
+                          Vec<String>, &lyrics::LyricRecord)> = None;
+    for r in recs {
+        let lines = align_lines(r);
+        let n_words: usize = lines.iter()
+            .map(|l| l.split_whitespace().count()).sum();
+        if n_words < 15 {
+            continue;
+        }
+        let w = al.align(&lp, &lines);
+        let heard = w.iter()
+            .filter(|x| x.conf >= ctcalign::MIN_WORD_CONF).count();
+        let frac = heard as f32 / n_words as f32;
+        say!("  align[{}]: {} lines/{} words, heard {:.0}%",
+                 r.source, lines.len(), n_words, frac * 100.0);
+        if best.as_ref().is_none_or(|b| frac > b.0) {
+            best = Some((frac, w, lines, r));
+        }
+    }
+    let Some((frac, words, lines, r)) = best else { return false };
+    if frac < 0.35 {
+        say!("align: best record only {:.0}% heard — wrong version? \
+                   falling back to asr matching", frac * 100.0);
         return false;
     }
+    let onsets = onset::strength(audio16);
+    let source = serde_json::json!({
+        "type": "generated",
+        "extractor": "rmvpe",
+        "lyrics": format!("ctc-{backend:?}"),
+        "lrc": !r.synced.is_empty(),
+        "align_heard": (frac * 100.0).round() / 100.0,
+        "align_src": r.source,
+    });
+    meta.lyrics_kind = Some(format!("ctc-{backend:?}"));
+    match genchart::generate_aligned(artist, title, &lines, &words,
+                                     curve, Some(&onsets), source, meta) {
+        Some(chart) => {
+            if let Err(e) = ups_core::chart::save_native(&chart, dest) {
+                say!("chart write failed: {e}");
+                return false;
+            }
+            let n: usize =
+                chart.tracks.values().map(|v| v.len()).sum();
+            say!("chart: aligned {n} notes over {} lines \
+                      ({}, {:.0}% heard)",
+                     meta.lines, r.source, frac * 100.0);
+            true
+        }
+        None => false,
+    }
+}
+
+fn gen_chart(args: &Args, media: &Path, artist: &str, title: &str,
+             asr_words: &[asr::AsrWord], dest: &Path,
+             recs: &[lyrics::LyricRecord],
+             rec: Option<&lyrics::LyricRecord>,
+             lang: Option<&str>,
+             cached_curve: Option<rmvpe::Curve>)
+             -> Option<genchart::GenMeta> {
     let asr: Vec<(String, f64)> = wordmap::norm_asr(
         &asr_words.iter()
             .map(|w| (w.word.clone(), w.start_ms, w.end_ms))
             .collect::<Vec<_>>());
-    // RMVPE curve on the 16k vocal stem (or raw 16k mono);
-    // the batch path hands us the sidecar-cached curve instead
+    // shared 16k mono: vocal stem first, raw decode as backup — feeds
+    // rmvpe, the CTC aligner, and onset strength
+    let backend = ctcalign::backend_for(&args.models,
+                                        lang.unwrap_or(""));
+    let want_audio = (backend.is_some() && !recs.is_empty())
+        || (cached_curve.is_none() && rmvpe::have_model(&args.models));
+    let audio16 = want_audio.then(|| {
+        let voc = media.with_extension("vocals.wav");
+        if voc.exists() {
+            ff::read_wav_f32(&voc).map(|(s, _, _)| s).ok()
+        } else {
+            ff::decode_f32(media, 16000, 1).ok()
+        }
+    }).flatten();
+    // RMVPE curve: batch hands us the sidecar-cached curve instead
     let curve = cached_curve.or_else(|| {
         if !rmvpe::have_model(&args.models) {
             return None;
         }
         stage("extracting melody (rmvpe)");
-        let audio16 = {
-            let voc = media.with_extension("vocals.wav");
-            if voc.exists() {
-                ff::read_wav_f32(&voc).map(|(s, _, _)| s).ok()
-            } else {
-                ff::decode_f32(media, 16000, 1).ok()
-            }
-        };
-        audio16.and_then(|a| {
-            rmvpe::extract_curve(&a, &args.models)
+        audio16.as_ref().and_then(|a| {
+            rmvpe::extract_curve(a, &args.models)
                 .map_err(|e| say!("rmvpe failed: {e}")).ok()
                 .inspect(|c| {
                     let voiced = c.f0.iter().zip(&c.conf)
@@ -1007,11 +1240,6 @@ fn gen_chart(args: &Args, media: &Path, artist: &str, title: &str,
                    (all freestyle)", args.models.display());
         None
     });
-    let (synced, plain): (Vec<(i64, String)>, Vec<String>) =
-        match rec {
-            Some(r) => (r.synced.clone(), r.plain.clone()),
-            None => (Vec::new(), Vec::new()),
-        };
     let mut meta = genchart::GenMeta {
         lyrics_kind: None,
         lrc_shift_ms: None,
@@ -1019,13 +1247,35 @@ fn gen_chart(args: &Args, media: &Path, artist: &str, title: &str,
         lines: 0, interp_lines: 0, asr_lines: 0,
         words: 0, asr_words: 0, matched: 0, total: 0,
     };
+    // forced-alignment path first — word onsets come straight off
+    // the acoustic model, no ASR transcript needed
+    if let (Some(b), Some(a)) = (backend, audio16.as_ref()) {
+        if !recs.is_empty() {
+            stage("aligning lyrics (ctc)");
+            if aligned_chart(args, a, artist, title, recs, b,
+                             curve.as_ref(), dest, &mut meta) {
+                return Some(meta);
+            }
+        }
+    }
+    // fuzzy fallback: match lyric words against the ASR transcript
+    if asr.len() < 20 {
+        say!("chart: too few asr words ({}) — need an imported \
+                   chart or better audio", asr.len());
+        return None;
+    }
+    let (synced, plain): (Vec<(i64, String)>, Vec<String>) =
+        match rec {
+            Some(r) => (r.synced.clone(), r.plain.clone()),
+            None => (Vec::new(), Vec::new()),
+        };
     stage("generating chart");
     match genchart::generate(artist, title, &synced, &plain, &asr,
                              curve.as_ref(), &mut meta) {
         Some(chart) => {
             if let Err(e) = ups_core::chart::save_native(&chart, dest) {
                 say!("chart write failed: {e}");
-                return false;
+                return None;
             }
             let n: usize =
                 chart.tracks.values().map(|v| v.len()).sum();
@@ -1035,12 +1285,12 @@ fn gen_chart(args: &Args, media: &Path, artist: &str, title: &str,
                      meta.lrc_shift_ms
                          .map(|s| format!(", lrc shift {s:.0}ms"))
                          .unwrap_or_default());
-            true
+            Some(meta)
         }
         None => {
             say!("chart: generation produced nothing usable \
                        — try --chart with an imported file");
-            false
+            None
         }
     }
 }

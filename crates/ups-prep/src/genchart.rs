@@ -913,6 +913,27 @@ pub fn generate(artist: &str, title: &str,
     }
     all_words = merged;
 
+    let source = serde_json::json!({
+        "type": "generated",
+        "extractor": "rmvpe",
+        "lrc": lyrics_kind.as_deref() == Some("lrc"),
+        "lyrics": lyrics_kind,
+    });
+    meta.lyrics_kind = lyrics_kind.clone();
+    meta.lines = spans.len();
+    meta.interp_lines = spans.values().filter(|s| s.interp).count();
+    meta.asr_lines = spans.values().filter(|s| s.asr_native).count();
+    meta.asr_words = asr.len();
+    finish_chart(artist, title, all_words, line_breaks, curve, source, meta)
+}
+
+/// Shared chart assembly: per-word pitch from the curve, note list,
+/// line breaks, romanization, key estimate, validation.
+fn finish_chart(artist: &str, title: &str,
+                all_words: Vec<(String, f64, f64, usize)>,
+                line_breaks: Vec<f64>, curve: Option<&Curve>,
+                source: serde_json::Value, meta: &mut GenMeta)
+                -> Option<Chart> {
     // pitch per word
     let wn: Vec<Option<(i64, f64)>> = match curve {
         Some(c) => word_notes(
@@ -932,7 +953,16 @@ pub fn generate(artist: &str, title: &str,
         ("CREATOR".into(), "ultrapistar-genchart".into()),
     ].into_iter().collect();
     let mut p1 = Vec::new();
-    for ((w, s, e, _li), p) in all_words.iter().zip(&wn) {
+    for (i, ((w, s, e, _li), p)) in
+        all_words.iter().zip(&wn).enumerate() {
+        // never let the min-length floor push a note over the next
+        // word's start — fast-sung words get short-but-valid notes
+        let e = all_words.get(i + 1).map(|n| n.1.min(*e))
+            .unwrap_or(*e);
+        let mut len = (e - s).round().max(50.0);
+        if let Some(n) = all_words.get(i + 1) {
+            len = len.min((n.1 - s).round().max(1.0));
+        }
         let (kind, tone) = match p {
             Some((tone, conf)) if *conf >= MIN_CONF =>
                 ("normal", *tone),
@@ -941,7 +971,7 @@ pub fn generate(artist: &str, title: &str,
         p1.push(Note {
             kind: kind.into(),
             start: s.round() as i64,
-            length: (e - s).round().max(50.0) as i64,
+            length: len as i64,
             pitch: tone,
             text: w.clone(),
             word_break: true,
@@ -954,18 +984,8 @@ pub fn generate(artist: &str, title: &str,
         "P1".into(),
         line_breaks[..line_breaks.len().saturating_sub(1)]
             .iter().map(|b| b.round() as i64).collect());
-    chart.source = serde_json::json!({
-        "type": "generated",
-        "extractor": "rmvpe",
-        "lrc": lyrics_kind.as_deref() == Some("lrc"),
-        "lyrics": lyrics_kind,
-    });
-    meta.lyrics_kind = lyrics_kind.clone();
-    meta.lines = spans.len();
-    meta.interp_lines = spans.values().filter(|s| s.interp).count();
-    meta.asr_lines = spans.values().filter(|s| s.asr_native).count();
+    chart.source = source;
     meta.words = all_words.len();
-    meta.asr_words = asr.len();
     if let Some(c) = curve {
         if let Some(k) = estimate_key(c, 0.5) {
             chart.source["key"] = serde_json::json!(k);
@@ -976,4 +996,117 @@ pub fn generate(artist: &str, title: &str,
     } else {
         None
     }
+}
+
+// ---- forced-alignment path ---------------------------------------------
+
+/// Where the voice stops after `start`: first ≥120 ms unvoiced stretch
+/// in the pitch curve, bounded by `limit`. No curve → `limit`.
+fn voiced_end(curve: Option<&Curve>, start: f64, limit: f64) -> f64 {
+    let Some(c) = curve else { return limit };
+    if c.times.len() < 2 {
+        return limit;
+    }
+    let hop = (c.times[1] - c.times[0]) * 1000.0;
+    let i0 = ((start + 60.0) / hop) as usize;
+    let i1 = ((limit / hop) as usize).min(c.times.len());
+    let need = (120.0 / hop).ceil() as usize;
+    let mut unv = 0usize;
+    for i in i0..i1 {
+        let voiced = c.f0[i] > 0.0 && c.conf[i] >= 0.3;
+        if voiced {
+            unv = 0;
+        } else {
+            unv += 1;
+            if unv >= need {
+                return ((i + 1 - unv) as f64 * hop).max(start + 50.0);
+            }
+        }
+    }
+    limit
+}
+
+/// Chart from forced-aligned words. `words` are in lyric order with
+/// 80/20 ms frame positions; here they get acoustic polish:
+///  * start snapped back to the nearest spectral-flux onset (CTC fires
+///    late), monotone-enforced
+///  * end from the voicing curve, bounded by the next word / line and
+///    MAX_HELD_MS
+///  * words the model didn't hear (low conf) keep their path position
+///    but are flagged so the caller's metrics see them
+pub fn generate_aligned(artist: &str, title: &str, lines: &[String],
+                        words: &[crate::ctcalign::AlignedWord],
+                        curve: Option<&Curve>, onsets: Option<&[f32]>,
+                        source: serde_json::Value, meta: &mut GenMeta)
+                        -> Option<Chart> {
+    if words.len() < 15 {
+        return None;
+    }
+    let mut ws: Vec<(String, f64, f64, usize, f32)> = words.iter()
+        .map(|w| (w.text.clone(), w.start_ms, w.end_ms, w.line, w.conf))
+        .collect();
+    ws.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap()
+               .then(a.3.cmp(&b.3)));
+
+    // onset snap: confident words look back up to 240 ms (3 frames at
+    // 80 ms) and a little forward; unheard words only lightly
+    if let Some(on) = onsets {
+        let starts: Vec<f64> = ws.iter().map(|w| w.1).collect();
+        for (i, w) in ws.iter_mut().enumerate() {
+            let (back, fwd, min) = if w.4 >= crate::ctcalign::MIN_WORD_CONF {
+                (240.0, 60.0, 0.25)
+            } else {
+                (120.0, 60.0, 0.4)
+            };
+            // never cross the previous word's start
+            let floor = if i > 0 { starts[i - 1] + 50.0 } else { 0.0 };
+            if let Some(t) = crate::onset::snap(on, w.1, back, fwd, min) {
+                w.1 = t.max(floor);
+            }
+        }
+    }
+    // monotone starts
+    for i in 1..ws.len() {
+        if ws[i].1 < ws[i - 1].1 + 40.0 {
+            ws[i].1 = ws[i - 1].1 + 40.0;
+        }
+    }
+    // ends: voicing-bounded, never into the next word
+    let n = ws.len();
+    for i in 0..n {
+        let next_start = ws.get(i + 1).map(|w| w.1);
+        let line_end = next_start.is_none_or(|_| ws[i + 1].3 != ws[i].3);
+        let limit = match next_start {
+            Some(ns) => ns - if line_end { 80.0 } else { 20.0 },
+            None => ws[i].1 + 3000.0,
+        }.min(ws[i].1 + MAX_HELD_MS);
+        let start = ws[i].1;
+        let mut end = if line_end {
+            voiced_end(curve, start, limit)
+        } else {
+            // mid-line: the next word's onset is the hard boundary; the
+            // CTC end is only a lower bound
+            limit.max(start + 50.0)
+        };
+        if end < start + 50.0 {
+            end = start + 50.0;
+        }
+        ws[i].2 = end;
+    }
+
+    // line breaks at the last word of each line (lyric order)
+    let mut all_words: Vec<(String, f64, f64, usize)> = Vec::new();
+    let mut line_breaks: Vec<f64> = Vec::new();
+    for i in 0..n {
+        let (t, s, e, li, _) = &ws[i];
+        all_words.push((t.clone(), *s, *e, *li));
+        if i + 1 == n || ws[i + 1].3 != *li {
+            line_breaks.push(*e);
+        }
+    }
+    let heard = ws.iter().filter(|w| w.4 >= crate::ctcalign::MIN_WORD_CONF).count();
+    meta.lines = lines.len();
+    meta.matched = heard;
+    meta.total = ws.len();
+    finish_chart(artist, title, all_words, line_breaks, curve, source, meta)
 }
