@@ -351,19 +351,29 @@ impl State {
     }
 
     pub fn persist(&self) {
+        // take each lock, clone, release — one at a time. Chaining
+        // `lock().clone()` inside the struct literal keeps every guard
+        // alive until the literal completes, so persist would hold
+        // all 11 mutexes at once: an AB-BA deadlock against any
+        // handler that locks two fields in the other order (seen
+        // live: tv thread in set_sync_offset→persist vs axum handler)
+        let performers = self.performers.lock().unwrap().clone();
+        let queue = self.queue.lock().unwrap().clone();
+        let history = self.history.lock().unwrap().clone();
+        let next_performer = *self.next_performer.lock().unwrap();
+        let next_queue_item = *self.next_queue_item.lock().unwrap();
+        let host_performer_id = *self.host_performer_id.lock().unwrap();
+        let sync_offsets = self.sync_offsets.lock().unwrap().clone();
+        let sync_offset_charts =
+            self.sync_offset_charts.lock().unwrap().clone();
+        let autosync_mic = Some(*self.autosync_mic.lock().unwrap());
+        let output_target = self.output_target.lock().unwrap().clone();
+        let mic_delay_ms = Some(*self.mic_delay_ms.lock().unwrap());
         let p = Persisted {
-            performers: self.performers.lock().unwrap().clone(),
-            queue: self.queue.lock().unwrap().clone(),
-            history: self.history.lock().unwrap().clone(),
-            next_performer: *self.next_performer.lock().unwrap(),
-            next_queue_item: *self.next_queue_item.lock().unwrap(),
-            host_performer_id: *self.host_performer_id.lock().unwrap(),
-            sync_offsets: self.sync_offsets.lock().unwrap().clone(),
-            sync_offset_charts: self.sync_offset_charts
-                .lock().unwrap().clone(),
-            autosync_mic: Some(*self.autosync_mic.lock().unwrap()),
-            output_target: self.output_target.lock().unwrap().clone(),
-            mic_delay_ms: Some(*self.mic_delay_ms.lock().unwrap()),
+            performers, queue, history, next_performer,
+            next_queue_item, host_performer_id, sync_offsets,
+            sync_offset_charts, autosync_mic, output_target,
+            mic_delay_ms,
         };
         let path = self.state_path.read().unwrap().clone();
         let tmp = path.with_extension("tmp");
@@ -536,11 +546,17 @@ impl State {
             entries.iter().find(|e| e.id == entry_id)
                 .and_then(|e| e.chart_mtime)
         };
-        let mut charts = self.sync_offset_charts.lock().unwrap();
-        match mt {
-            Some(m) => { charts.insert(entry_id, m); }
-            None => { charts.remove(&entry_id); }
+        {
+            let mut charts = self.sync_offset_charts.lock().unwrap();
+            match mt {
+                Some(m) => { charts.insert(entry_id, m); }
+                None => { charts.remove(&entry_id); }
+            }
         }
+        // the guard must be gone before persist — it re-locks every
+        // field mutex, and a std Mutex won't re-enter: holding
+        // `charts` across this call deadlocked the whole app on the
+        // first autosync-applied offset (tv+http both froze)
         self.persist();
     }
 
