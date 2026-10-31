@@ -206,6 +206,10 @@ struct Persisted {
     /// entry_id -> learned chart->media nudge (host sync buttons)
     #[serde(default)]
     sync_offsets: BTreeMap<i64, f64>,
+    /// entry_id -> chart file mtime the nudge was learned on — a
+    /// regenerated chart invalidates the offset it was measured against
+    #[serde(default)]
+    sync_offset_charts: BTreeMap<i64, u64>,
     #[serde(default)]
     autosync_mic: Option<bool>,
     #[serde(default)]
@@ -243,6 +247,8 @@ pub struct State {
     pub play_at: Mutex<BTreeMap<i64, f64>>,
     /// entry_id -> chart->media nudge (persists across restarts)
     pub sync_offsets: Mutex<BTreeMap<i64, f64>>,
+    /// chart mtime each nudge was learned on (drop offset on rechart)
+    pub sync_offset_charts: Mutex<BTreeMap<i64, u64>>,
     /// pitch-solve autosync toggle (GET/POST /playback/autosync)
     pub autosync_mic: Mutex<bool>,
     /// saved audio output (sink_name or card json) applied at boot
@@ -289,6 +295,7 @@ impl State {
             state_path: RwLock::new(state_path),
             play_at: Mutex::new(BTreeMap::new()),
             sync_offsets: Mutex::new(BTreeMap::new()),
+            sync_offset_charts: Mutex::new(BTreeMap::new()),
             autosync_mic: Mutex::new(true),
             output_target: Mutex::new(None),
             mic_delay_ms: Mutex::new(40.0),
@@ -322,7 +329,18 @@ impl State {
         // a persisted host claim would outlive the phone that made it —
         // the room reboots unhosted (badge shows the code again)
         let _ = p.host_performer_id;
-        *self.sync_offsets.get_mut().unwrap() = p.sync_offsets;
+        {
+            let entries = self.entries.read().unwrap();
+            let mtimes = self.sync_offset_charts.get_mut().unwrap();
+            *mtimes = p.sync_offset_charts;
+            self.sync_offsets.get_mut().unwrap()
+                .extend(p.sync_offsets.iter().filter(|(id, _)| {
+                    let mt = entries.iter()
+                        .find(|e| e.id == **id)
+                        .and_then(|e| e.chart_mtime);
+                    mt.is_some() && mtimes.get(*id) == mt.as_ref()
+                }).map(|(id, off)| (*id, *off)));
+        }
         if let Some(a) = p.autosync_mic {
             *self.autosync_mic.get_mut().unwrap() = a;
         }
@@ -341,6 +359,8 @@ impl State {
             next_queue_item: *self.next_queue_item.lock().unwrap(),
             host_performer_id: *self.host_performer_id.lock().unwrap(),
             sync_offsets: self.sync_offsets.lock().unwrap().clone(),
+            sync_offset_charts: self.sync_offset_charts
+                .lock().unwrap().clone(),
             autosync_mic: Some(*self.autosync_mic.lock().unwrap()),
             output_target: self.output_target.lock().unwrap().clone(),
             mic_delay_ms: Some(*self.mic_delay_ms.lock().unwrap()),
@@ -511,6 +531,16 @@ impl State {
             .lock()
             .unwrap()
             .insert(entry_id, off_ms);
+        let mt = {
+            let entries = self.entries.read().unwrap();
+            entries.iter().find(|e| e.id == entry_id)
+                .and_then(|e| e.chart_mtime)
+        };
+        let mut charts = self.sync_offset_charts.lock().unwrap();
+        match mt {
+            Some(m) => { charts.insert(entry_id, m); }
+            None => { charts.remove(&entry_id); }
+        }
         self.persist();
     }
 
