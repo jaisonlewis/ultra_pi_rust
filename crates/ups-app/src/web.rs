@@ -776,6 +776,7 @@ async fn api_catalog_rescan(AxState(app): AxState<Arc<App>>,
         "charts_added": r.upgraded,
         "songs": r.total,
         "root": app.st.root(),
+        "roots": app.st.roots(),
     }))
     .into_response()
 }
@@ -1430,8 +1431,10 @@ fn pending_charts(app: &App) -> Vec<Value> {
         }
     }
     let mut files = Vec::new();
-    for d in ["chart-library", "charts"] {
-        walk(&app.st.root().join(d), &mut files, 0);
+    for root in app.st.roots() {
+        for d in ["chart-library", "charts"] {
+            walk(&root.join(d), &mut files, 0);
+        }
     }
     let entries = app.st.entries.read().unwrap().clone();
     files

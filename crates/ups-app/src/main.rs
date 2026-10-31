@@ -122,7 +122,11 @@ fn main() {
     eprintln!(
         "ups-app: {} songs under {}",
         st.entries.read().unwrap().len(),
-        st.root().display()
+        st.roots()
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(" + ")
     );
     eprintln!("ups-app: host key {}", st.host_key);
     eprintln!("ups-app: join url {}/", lan_addr(port));

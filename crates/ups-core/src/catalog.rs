@@ -578,22 +578,23 @@ fn mount_bases() -> Vec<PathBuf> {
     v
 }
 
-/// Find a media stick on any mounted volume: `/media/<u>/<label>`,
+/// Every media stick found on mounted volumes: `/media/<u>/<label>`,
 /// `/run/media/<u>/<label>`, `/mnt/<label>`, `D:\` … — and for
 /// user-level dirs one more level down (`/media/jaison/STICK`).
-/// Returns the song root (the mount's `ultrapistar/` child or the
-/// mount itself when marker-only).
-pub fn find_stick() -> Option<PathBuf> {
+/// Multiple drives all count — the library is their union.
+/// Order is mount scan order (stable); UPS_MEDIA_DIR short-circuits.
+pub fn find_sticks() -> Vec<PathBuf> {
     if let Ok(p) = std::env::var("UPS_MEDIA_DIR") {
         if !p.is_empty() {
             let p = PathBuf::from(p);
-            return Some(stick_root(&p).unwrap_or(p));
+            return vec![stick_root(&p).unwrap_or(p)];
         }
     }
+    let mut found: Vec<PathBuf> = Vec::new();
     let mut mounts: Vec<PathBuf> = Vec::new();
     for base in mount_bases() {
         if let Some(p) = stick_root(&base) {
-            return Some(p);
+            found.push(p);
         }
         let Ok(rd) = std::fs::read_dir(&base) else { continue };
         for e in rd.flatten() {
@@ -610,44 +611,60 @@ pub fn find_stick() -> Option<PathBuf> {
         }
     }
     // one level down — /media/<user>/<label>, /run/media/<user>/<label>
-    for m in mounts.iter().cloned().collect::<Vec<_>>() {
+    for m in mounts {
         if let Some(p) = stick_root(&m) {
-            return Some(p);
+            found.push(p);
+            continue;
         }
         if let Ok(rd) = std::fs::read_dir(&m) {
             for e in rd.flatten() {
                 let p = e.path();
                 if p.is_dir() {
                     if let Some(s) = stick_root(&p) {
-                        return Some(s);
+                        found.push(s);
                     }
                 }
             }
         }
     }
-    None
+    found
 }
 
-/// Resolve the effective media root, in order:
+/// Back-compat single-root lookup — the first discovered stick.
+pub fn find_stick() -> Option<PathBuf> {
+    find_sticks().into_iter().next()
+}
+
+/// Resolve the effective media roots, in order:
 ///   1. `--root` aimed at a mountpoint descends into its `ultrapistar/`
-///   2. a discovered stick on any mounted volume — the Python app's
-///      "stick becomes the root" rule, so a plugged-in drive IS the
-///      library on every appliance
-///   3. `--root` verbatim — the static fallback when no stick is found
+///   2. every discovered stick joins the library — multiple pendrives
+///      union (the Python app's `media_dir` + `media_extra_dirs`
+///      semantics: first root is the primary, others read alongside)
+///   3. `--root` verbatim always rides along as the static root
 ///      (UPS_NO_USB=1 skips discovery, making it fully authoritative)
-pub fn resolve_root(explicit: &Path) -> PathBuf {
-    if let Some(inner) = stick_root(explicit) {
-        return inner;
-    }
+pub fn resolve_roots(explicit: &Path) -> Vec<PathBuf> {
+    let explicit = stick_root(explicit).unwrap_or_else(|| explicit.to_path_buf());
     let no_usb = std::env::var("UPS_NO_USB")
         .map(|v| v == "1")
         .unwrap_or(false);
-    if !no_usb {
-        if let Some(stick) = find_stick() {
-            return stick;
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if no_usb {
+        roots.push(explicit);
+    } else {
+        roots.extend(find_sticks());
+        if !roots.contains(&explicit) {
+            roots.push(explicit);
         }
     }
-    explicit.to_path_buf()
+    roots
+}
+
+/// Back-compat: the first resolved root.
+pub fn resolve_root(explicit: &Path) -> PathBuf {
+    resolve_roots(explicit)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| explicit.to_path_buf())
 }
 
 /// Manifest records plus any folders the manifest doesn't know about —
@@ -674,4 +691,37 @@ pub fn scan(root: &Path) -> Vec<Song> {
             .filter(|s| !seen.contains(&s.media)),
     );
     songs
+}
+
+/// Union scan across several roots — multiple pendrives count as one
+/// library. A song duplicated on two sticks (same provider id, or
+/// same normalized artist+title) lists once; the earlier root wins.
+pub fn scan_roots(roots: &[PathBuf]) -> Vec<Song> {
+    let mut out: Vec<Song> = Vec::new();
+    let mut seen_ids: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut seen_names: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for root in roots {
+        if !root.is_dir() {
+            continue;
+        }
+        for s in scan(root) {
+            let name_key = format!(
+                "{}\u{0}{}",
+                s.artist.to_lowercase(),
+                s.title.to_lowercase()
+            );
+            if !s.source_id.is_empty()
+                && !seen_ids.insert(s.source_id.clone())
+            {
+                continue;
+            }
+            if !seen_names.insert(name_key) {
+                continue;
+            }
+            out.push(s);
+        }
+    }
+    out
 }

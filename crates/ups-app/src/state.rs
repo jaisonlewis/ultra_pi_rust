@@ -213,7 +213,8 @@ struct Persisted {
 }
 
 pub struct State {
-    root: RwLock<PathBuf>,
+    /// media roots — first is primary; more = extra sticks unioned in
+    roots: RwLock<Vec<PathBuf>>,
     /// the --root arg (or cwd) as passed — re-resolved each rescan so
     /// a newly-mounted stick can take over mid-run
     explicit_root: PathBuf,
@@ -251,16 +252,16 @@ impl State {
     pub fn new(root: PathBuf, host_key: String, build_v: String,
                difficulty: i64, vocal_cut: bool, intermission_sec: f64,
                state_path: PathBuf) -> Self {
-        let resolved = catalog::resolve_root(&root);
+        let resolved = catalog::resolve_roots(&root);
         let entries = RwLock::new(
-            catalog::scan(&resolved)
+            catalog::scan_roots(&resolved)
                 .iter()
                 .enumerate()
                 .map(|(i, s)| entry_of(s, (i + 1) as i64))
                 .collect::<Vec<_>>(),
         );
         let mut st = State {
-            root: RwLock::new(resolved),
+            roots: RwLock::new(resolved),
             explicit_root: root,
             host_key,
             build_v,
@@ -333,36 +334,53 @@ impl State {
         }
     }
 
-    /// The effective media root (may point at a USB stick).
+    /// The primary media root (first resolved — usually the first
+    /// stick found; the library may span several).
     pub fn root(&self) -> PathBuf {
-        self.root.read().unwrap().clone()
+        self.roots
+            .read()
+            .unwrap()
+            .first()
+            .cloned()
+            .unwrap_or_else(|| self.explicit_root.clone())
     }
 
-    /// Re-check whether a better media root appeared — a stick
-    /// mounted since boot, or the current root's mount pulled. The
-    /// same resolution rule as startup: `ultrapistar/` descend,
-    /// discovered stick wins, explicit --root is the fallback.
-    /// Swaps `root` when the answer changes; callers rescan after.
+    /// All effective media roots.
+    pub fn roots(&self) -> Vec<PathBuf> {
+        self.roots.read().unwrap().clone()
+    }
+
+    /// Re-check whether the root set changed — a stick mounted since
+    /// boot, a mount pulled, or the explicit root appearing. Swaps the
+    /// list when the resolution differs; callers rescan after.
     pub fn refresh_root(&self) -> bool {
-        let next = catalog::resolve_root(&self.explicit_root);
-        let mut root = self.root.write().unwrap();
-        if next != *root {
-            eprintln!("media root: {} -> {}", root.display(),
-                      next.display());
-            *root = next;
+        let next = catalog::resolve_roots(&self.explicit_root);
+        let mut roots = self.roots.write().unwrap();
+        if next != *roots {
+            eprintln!("media roots: {} -> {}",
+                      roots
+                          .iter()
+                          .map(|p| p.display().to_string())
+                          .collect::<Vec<_>>()
+                          .join(", "),
+                      next.iter()
+                          .map(|p| p.display().to_string())
+                          .collect::<Vec<_>>()
+                          .join(", "));
+            *roots = next;
             true
         } else {
             false
         }
     }
 
-    /// Re-walk the media root and merge changes in place — new song
+    /// Re-walk the media roots and merge changes in place — new song
     /// folders appear, removed ones drop, and songs that gained an
     /// inst/chart/art sidecar upgrade without losing their entry id
     /// (so the queue keeps pointing at the right song).
     pub fn rescan(&self) -> Rescan {
         self.refresh_root();
-        let songs = catalog::scan(&self.root());
+        let songs = catalog::scan_roots(&self.roots());
         let mut entries = self.entries.write().unwrap();
         let mut r = Rescan {
             total: songs.len(),
@@ -648,7 +666,12 @@ impl State {
             "queue": queued,
             "queue_count": queued.len() + playing.is_some() as usize,
             "song_count": self.entries.read().unwrap().len(),
-            "library_root": self.root().to_string_lossy(),
+            "library_root": self
+                .roots()
+                .iter()
+                .map(|p| p.to_string_lossy().to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
         })
     }
 
