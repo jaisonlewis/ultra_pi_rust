@@ -689,7 +689,10 @@ fn play_item(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
 
     // audio is the master clock — same rule as the web TV
     let src: Box<dyn Source<Item = f32> + Send> = match pcm {
-        Some((samples, ch, rate)) if !samples.is_empty() => Box::new(
+        // rate 0 panics inside rodio — a malformed stream must fall
+        // back to the decoder, not crash the renderer in a respawn loop
+        Some((samples, ch, rate)) if !samples.is_empty()
+            && rate > 0 && ch > 0 => Box::new(
             rodio::buffer::SamplesBuffer::new(ch, rate, samples),
         ),
         _ => match StreamingSource::open(&it.audio) {

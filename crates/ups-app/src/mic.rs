@@ -29,6 +29,10 @@ fn open_dev(dev: cpal::Device)
     let name = dev.name().unwrap_or_default();
     let cfg = dev.default_input_config().ok()?;
     let rate = cfg.sample_rate().0;
+    // virtual/loopback nodes can advertise rate 0 — unusable capture
+    if rate == 0 {
+        return None;
+    }
     let shared = Arc::new(Mutex::new(VecDeque::<i16>::new()));
     let cfg_stream: cpal::StreamConfig = cfg.clone().into();
     let err_fn = |e: cpal::StreamError| eprintln!("mic error: {e}");
@@ -172,10 +176,22 @@ pub fn calibrate() -> Result<f64, String> {
     // energy thresholds but not correlation
     let host = cpal::default_host();
     let devs = host.input_devices().map_err(|e| e.to_string())?;
+    let want = std::env::var("UPS_MIC_DEVICE").ok();
     let mut opened = None;
     for dev in devs {
+        let name = dev.name().unwrap_or_default();
+        if let Some(w) = &want {
+            if !name.contains(w.as_str()) {
+                continue;
+            }
+        }
         let Ok(cfg) = dev.default_input_config() else { continue };
         let rate = cfg.sample_rate().0 as f64;
+        // virtual nodes can advertise rate 0 — the click SamplesBuffer
+        // built on it panics (observed on the Pi's pipewire path)
+        if rate == 0.0 {
+            continue;
+        }
         let shared = Arc::new(Mutex::new(Vec::<(Instant, Vec<i16>)>::new()));
         let cfg_stream: cpal::StreamConfig = cfg.clone().into();
         let err_fn = |e: cpal::StreamError| eprintln!("mic error: {e}");
@@ -210,11 +226,12 @@ pub fn calibrate() -> Result<f64, String> {
         if stream.play().is_err() {
             continue;
         }
-        opened = Some((stream, shared, rate));
+        opened = Some((stream, shared, rate, name));
         break;
     }
-    let (_cap, shared, sr) = opened
+    let (_cap, shared, sr, dev_name) = opened
         .ok_or_else(|| "no capture device".to_string())?;
+    eprintln!("mic-cal: capturing on {dev_name} @ {sr} Hz");
 
     // click pattern in the capture's own rate — the acoustic 1kHz is
     // what the mic hears either way, and correlating in one domain
@@ -255,6 +272,16 @@ pub fn calibrate() -> Result<f64, String> {
     let total: usize = chunks.iter().map(|(_, c)| c.len()).sum();
     let pcm: Vec<f32> = chunks.iter()
         .flat_map(|(_, c)| c.iter().map(|&v| v as f32)).collect();
+    // what did the mic actually hear — silence means the wrong device
+    // (loopback/monitor node), nonzero noise floor means it's alive
+    let rms = (pcm.iter().map(|&v| (v * v) as f64).sum::<f64>()
+        / pcm.len().max(1) as f64)
+        .sqrt();
+    let peak = pcm.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+    eprintln!(
+        "mic-cal: captured {:.2}s rms {rms:.4} peak {peak:.3}",
+        total as f64 / sr
+    );
 
     // normalized cross-correlation of the click against the capture
     let cf: Vec<f32> = click.iter().map(|&v| v as f32).collect();
@@ -294,6 +321,11 @@ pub fn calibrate() -> Result<f64, String> {
         }
     }
     peaks.sort_unstable();
+    let best = peaks.iter().map(|&i| corr[i]).fold(0.0f32, f32::max);
+    eprintln!(
+        "mic-cal: {} clicks above thr {thr:.3} (best corr {best:.3})",
+        peaks.len()
+    );
 
     // heard onset time per peak, then delay = heard - emitted
     let onset: Vec<f64> = peaks.iter().map(|&i| {

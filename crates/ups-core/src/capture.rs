@@ -66,6 +66,11 @@ impl MicCapture {
                 continue;
             };
             let rate = cfg.sample_rate().0;
+            // pipewire/loopback nodes can advertise rate 0 — a SamplesBuffer
+            // built on it panics, and the detector math divides by it
+            if rate == 0 {
+                continue;
+            }
             let shared = Arc::new(Mutex::new(VecDeque::<i16>::new()));
             let cfg_stream: cpal::StreamConfig = cfg.clone().into();
             let err_fn = |e: cpal::StreamError| eprintln!("mic error: {e}");
