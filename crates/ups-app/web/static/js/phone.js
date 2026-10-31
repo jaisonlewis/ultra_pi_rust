@@ -315,9 +315,13 @@ function setJoined(name) {
   joinCard.classList.add("hidden");
   remote.classList.remove("hidden");
   if (!isHost) $("#btn-host").classList.remove("hidden");
+  const chip = $("#who-chip");
+  chip.textContent = `🎤 ${name}`;
+  chip.classList.remove("hidden");
 }
 
 function showJoin() {
+  $("#join-name").value = myName;
   remote.classList.add("hidden");
   joinCard.classList.remove("hidden");
 }
@@ -325,7 +329,8 @@ function showJoin() {
 // server-side session can be lost even though localStorage still shows a
 // name — rejoin silently so host/queue calls don't fail out from under us
 async function ensureJoined() {
-  if (!myName) return;
+  // join card up = name unconfirmed — let the form do the real join
+  if (!myName || !joinCard.classList.contains("hidden")) return;
   try {
     const me = await api("/api/me");
     if (me.performer) { myPerformerId = me.performer.id; return; }
@@ -334,10 +339,20 @@ async function ensureJoined() {
   } catch (e) { /* offline */ }
 }
 
-if (myName) {
+// a stored name skips the prompt only after it was confirmed this
+// browser session — otherwise show the card prefilled so the singer
+// verifies (or fixes) who the queue will record them as
+if (myName && sessionStorage.getItem("ups_name_ok")) {
   $("#join-name").value = myName;
   setJoined(myName);
+} else if (myName) {
+  $("#join-name").value = myName;
 }
+
+$("#who-chip").addEventListener("click", () => {
+  sessionStorage.removeItem("ups_name_ok");
+  showJoin();
+});
 
 // restore host + performer state (session persists across reloads)
 api("/api/me").then(async (me) => {
@@ -355,6 +370,7 @@ $("#join-form").addEventListener("submit", async (e) => {
   try {
     const res = await api("/api/join", "POST", { name });
     if (res.performer) myPerformerId = res.performer.id;
+    sessionStorage.setItem("ups_name_ok", "1");
     setJoined(name);
     toast(`Welcome, ${name}!`);
   } catch (err) { toast(err.message, "error"); }
@@ -701,6 +717,7 @@ $("#confirm-form").addEventListener("submit", async (e) => {
   try {
     await api("/api/queue", "POST", body);
     $("#confirm").close();
+    sessionStorage.setItem("ups_name_ok", "1");
     setJoined(body.name);
     toast(`Queued: ${pendingEntry.title}`);
   } catch (err) { toast(err.message, "error"); }
