@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use minifb::{Key, ScaleMode, Window, WindowOptions};
@@ -42,6 +42,8 @@ pub struct PlayItem {
     pub audio_only: bool,
     /// score-attributed singers for the HUD
     pub singer: String,
+    /// second singer's name on duets ("" solo) — drives the P2 chip
+    pub singer2: String,
     pub tracks: Vec<String>,
     /// persisted chart->media nudge for this entry (0 when untouched)
     pub sync_offset: f64,
@@ -202,6 +204,23 @@ fn present(window: &mut Window, fb: &[u32], w: usize, h: usize) -> bool {
 
 /// karaoke wipe fill — the web TV's trackColors.P1
 const TRACK_P1: u32 = 0xff5a5a;
+const TRACK_P2: u32 = 0x4da3ff;
+
+/// (note pill, sung dot, trail underlay, trail core) per track index —
+/// duets get the web TV's trackColors (P1 red / P2 blue); solo keeps
+/// the classic blue-pill / red-cursor look
+fn track_skin(i: usize, duet: bool) -> (u32, u32, u32, u32) {
+    if !duet {
+        return (render::NOTE, render::SING_DOT,
+                render::TRAIL, render::TRAIL_GLOW);
+    }
+    match i {
+        0 => (TRACK_P1, TRACK_P1, 0xd84f4f, 0xffc9b0),
+        1 => (TRACK_P2, TRACK_P2, 0x2f6fd8, 0x9fc6ff),
+        _ => (render::NOTE, render::SING_DOT,
+              render::TRAIL, render::TRAIL_GLOW),
+    }
+}
 
 /// rating tiers on the scorer's 0..8 scale — same ladder as the web
 /// TV ("PERFECT LINE" reserved for the top rung)
@@ -532,15 +551,24 @@ fn play_item(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
     } else {
         it.tracks.clone()
     };
+    let duet = tracks.len() > 1;
     let mut sess = chart.clone().map(|c| {
         let mut s = Session::new(c, &tracks, 1, true);
         s.set_sync_offset(it.sync_offset);
         s
     });
-    let (mut phrases, mut notes) = chart
-        .as_ref()
-        .map(|c| display_text(c, &tracks[0], it.lyrics_rom))
-        .unwrap_or_default();
+    // per-track (phrases, notes) — duets draw every claimed part:
+    // stacked lane bands up top, one lyric line per part at the bottom
+    let mut track_text: Vec<(Vec<chart::Phrase>, Vec<chart::Note>)> =
+        tracks
+            .iter()
+            .map(|t| {
+                chart
+                    .as_ref()
+                    .map(|c| display_text(c, t, it.lyrics_rom))
+                    .unwrap_or_default()
+            })
+            .collect();
     let beat_ms = chart
         .as_ref()
         .map(|c| if c.bpm() > 0.0 { 15000.0 / c.bpm() } else { 0.0 })
@@ -550,9 +578,23 @@ fn play_item(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
         .map(|c| c.gap_ms() + it.sync_offset)
         .unwrap_or(0.0);
 
-    let mic = MicCapture::open();
-    let mic_tone = mic.as_ref().map(|m| Arc::clone(&m.tone));
-    driver.emit("mic:state", &json!({"ok": mic.is_some()}));
+    // one capture per physical mic when they're plugged in — device i
+    // scores track i; fewer mics than tracks reuses the last device,
+    // so a single-mic duet still scores both parts off one input
+    let mics = MicCapture::open_multi(tracks.len());
+    let mic_tones: Vec<Arc<Mutex<Option<i64>>>> = mics
+        .iter()
+        .map(|m| Arc::clone(&m.tone))
+        .collect();
+    let mic_tone_for = |i: usize| -> Option<i64> {
+        mic_tones
+            .get(i.min(mic_tones.len().saturating_sub(1)))
+            .and_then(|t| *t.lock().unwrap())
+    };
+    driver.emit(
+        "mic:state",
+        &json!({"ok": !mics.is_empty(), "mics": mics.len()}),
+    );
 
     let mut frame = vec![0u32; fw * fh];
     // bold face for the lyric line/score — web TV renders them at 700
@@ -561,12 +603,17 @@ fn play_item(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
     let mut last_tick = 0u64;
     let mut fx = Fx::new();
     let mut target_score: f64 = 0.0;
+    let mut target_scores: Vec<f64> = vec![0.0; tracks.len()];
+    let mut disp_scores: Vec<f64> = vec![0.0; tracks.len()];
     let mut cur_streak: i64 = 0;
     let song_start = Instant::now();
     // pitch lane flush at the top of the screen — HUD text overlays
     // its upper region (drawn after, on top); lyrics anchor bottom
     let lane_y = 0;
     let lane_h = (fh as f64 * 0.24) as i32;
+    // duets split the lane into stacked per-track bands (web tv.js
+    // does the same — one bandH per claimed part)
+    let band_h = lane_h / tracks.len().max(1) as i32;
 
     // intermission countdown — sink is paused, so nothing is audible
     // until it ends (media starts decoding only after, too)
@@ -748,9 +795,9 @@ fn play_item(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
         // host romaji flip — rebuild the lyric display text live
         if let Some(rom) = driver.take_rom_override() {
             if let Some(c) = &chart {
-                let (ph, ns) = display_text(c, &tracks[0], rom);
-                phrases = ph;
-                notes = ns;
+                for (i, tt) in track_text.iter_mut().enumerate() {
+                    *tt = display_text(c, &tracks[i], rom);
+                }
             }
         }
         if driver.take_resync_request() {
@@ -765,11 +812,10 @@ fn play_item(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
             if let Some(s) = &mut sess {
                 let mut tones: BTreeMap<String, Option<i64>> =
                     BTreeMap::new();
-                let tone =
-                    mic_tone.as_ref().and_then(|t| *t.lock().unwrap());
-                for tr in &tracks {
-                    tones.insert(tr.clone(), tone);
+                for (i, tr) in tracks.iter().enumerate() {
+                    tones.insert(tr.clone(), mic_tone_for(i));
                 }
+                let tone = mic_tone_for(0);
                 // pitch heard now was sung mic_delay ago — score it
                 // at the media position it answered (Python parity)
                 let score_ms =
@@ -790,14 +836,14 @@ fn play_item(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
                     hit_flash_until =
                         Instant::now() + Duration::from_millis(200);
                     // sparks at the hit note's row on the playhead
-                    let geo = render::lane_geo(fw, lane_h, 6000.0);
+                    let geo = render::lane_geo(fw, band_h, 6000.0);
                     let tone = r
                         .last_hit
                         .as_ref()
                         .and_then(|h| h.tone)
                         .unwrap_or(24);
                     let (px, ty) = render::lane_xy(
-                        geo, lane_y, lane_h, pos_ms, pos_ms, tone);
+                        geo, lane_y, band_h, pos_ms, pos_ms, tone);
                     let gold = r
                         .last_hit
                         .as_ref()
@@ -828,11 +874,13 @@ fn play_item(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
                 }
                 fx.last_streak = st;
                 cur_streak = st;
-                target_score = r
-                    .players
-                    .get(&tracks[0])
-                    .map(|p| (p.score + p.golden + p.line) as f64)
-                    .unwrap_or(target_score);
+                for (i, tr) in tracks.iter().enumerate() {
+                    if let Some(p) = r.players.get(tr) {
+                        target_scores[i] =
+                            (p.score + p.golden + p.line) as f64;
+                    }
+                }
+                target_score = target_scores[0];
                 driver.emit(
                     "clock",
                     &json!({"ms": pos_ms}),
@@ -890,41 +938,59 @@ fn play_item(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
             render::fill(fb, render::BG);
         }
 
-        if !notes.is_empty() {
-            let sung = mic_tone.as_ref().and_then(|t| *t.lock().unwrap());
-            render::draw_lane(
-                fb, fw, fh, &notes, gap_ms, beat_ms, pos_ms, lane_y,
-                lane_h, 6000.0, sung, Instant::now() < hit_flash_until,
-            );
-            let log: Vec<(f64, i64)> = sess
-                .as_ref()
-                .map(|s| {
-                    s.tone_log
-                        .values()
-                        .flatten()
-                        .cloned()
-                        .collect()
-                })
-                .unwrap_or_default();
-            render::draw_trail(fb, fw, fh, &log, pos_ms, lane_y,
-                               lane_h, 6000.0);
+        if track_text.iter().any(|(_, ns)| !ns.is_empty()) {
+            let flash = Instant::now() < hit_flash_until;
+            for (i, tr) in tracks.iter().enumerate() {
+                let by = lane_y + i as i32 * band_h;
+                let skin = track_skin(i, duet);
+                render::draw_lane(
+                    fb, fw, fh, &track_text[i].1, gap_ms, beat_ms,
+                    pos_ms, by, band_h, 6000.0, mic_tone_for(i),
+                    i == 0 && flash, (skin.0, skin.1),
+                );
+                if let Some(log) = sess
+                    .as_ref()
+                    .and_then(|s| s.tone_log.get(tr))
+                {
+                    render::draw_trail(
+                        fb, fw, fh, log, pos_ms, by, band_h, 6000.0,
+                        skin.2, skin.3,
+                    );
+                }
+            }
         }
 
         if let Some(t) = text {
             let lh_y = (fh as f64 * 0.82) as i32;
-            let cur = phrases.iter().find(|p| {
-                pos_ms >= gap_ms + p.start as f64 * beat_ms
-                    && pos_ms < gap_ms + p.end as f64 * beat_ms + 400.0
-            });
-            let next = phrases
+            let row_h = (lyric_px as f64 * 1.30) as i32;
+            // one current line per claimed part — duets stack P1 over
+            // P2, each karaoke-wiped in its own track color
+            let curs: Vec<(usize, &chart::Phrase)> = track_text
                 .iter()
-                .find(|p| gap_ms + p.start as f64 * beat_ms > pos_ms);
+                .enumerate()
+                .filter_map(|(i, tt)| {
+                    tt.0.iter()
+                        .find(|p| {
+                            pos_ms >= gap_ms + p.start as f64 * beat_ms
+                                && pos_ms
+                                    < gap_ms + p.end as f64 * beat_ms
+                                        + 400.0
+                        })
+                        .map(|p| (i, p))
+                })
+                .collect();
+            let next = track_text.first().and_then(|tt| {
+                tt.0.iter().find(|p| {
+                    gap_ms + p.start as f64 * beat_ms > pos_ms
+                })
+            });
             // the lyric card — same .lyric-band look as the browser TV:
             // a translucent dark rounded panel behind both lines so the
             // text reads over any video
-            if cur.is_some() || next.is_some() {
+            if !curs.is_empty() || next.is_some() {
                 let pad_v = (lyric_px as f64 * 0.42) as i32;
-                let y1 = lh_y + (62.0 * s) as i32 + next_px as i32
+                let y1 = lh_y + curs.len() as i32 * row_h
+                    + (62.0 * s) as i32 + next_px as i32
                     + (lyric_px as f64 * 0.30) as i32;
                 render::rrect(
                     fb, fw, fh,
@@ -934,7 +1000,10 @@ fn play_item(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
                 );
             }
             let tb = text_b.as_mut().unwrap_or(t);
-            if let Some(p) = cur {
+            for (row, (ti, p)) in curs.iter().enumerate() {
+                let ly = lh_y + row as i32 * row_h;
+                let wipe_col =
+                    if duet { track_skin(*ti, true).0 } else { TRACK_P1 };
                 let mut cx =
                     (fw as i32 - tb.width(&p.text, lyric_px) as i32) / 2;
                 let o = ((lyric_px as f64) / 26.0).ceil().max(1.0) as i32;
@@ -945,14 +1014,14 @@ fn play_item(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
                         / (e_ms - s_ms).max(1.0))
                     .clamp(0.0, 1.0);
                     let sw = tb.width(&syl.t, lyric_px) as i32;
-                    tb.draw_outline(fb, fw, fh, &syl.t, cx, lh_y,
+                    tb.draw_outline(fb, fw, fh, &syl.t, cx, ly,
                                     lyric_px, 0x05070d, o);
-                    tb.draw_clip(fb, fw, fh, &syl.t, cx, lh_y,
+                    tb.draw_clip(fb, fw, fh, &syl.t, cx, ly,
                                  lyric_px, 0xd1d1d1, i32::MAX);
                     if f > 0.0 {
                         let wipe = cx + (f * sw as f64) as i32;
-                        tb.draw_clip(fb, fw, fh, &syl.t, cx, lh_y,
-                                     lyric_px, TRACK_P1, wipe);
+                        tb.draw_clip(fb, fw, fh, &syl.t, cx, ly,
+                                     lyric_px, wipe_col, wipe);
                     }
                     cx += sw;
                     if syl.wb {
@@ -963,7 +1032,8 @@ fn play_item(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
             if let Some(p) = next {
                 let w = tb.width(&p.text, next_px) as i32;
                 let nx = (fw as i32 - w) / 2;
-                let ny = lh_y + (62.0 * s) as i32;
+                let ny = lh_y + curs.len() as i32 * row_h
+                    + (62.0 * s) as i32;
                 let o = ((next_px as f64) / 26.0).ceil().max(1.0) as i32;
                 tb.draw_outline(fb, fw, fh, &p.text, nx, ny, next_px,
                                 0x05070d, o);
@@ -974,6 +1044,10 @@ fn play_item(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
             // total instead of snapping (exponential approach, ~150ms)
             fx.disp_score += (target_score - fx.disp_score)
                 * (1.0 - (-6.0 * dt as f64).exp());
+            for i in 0..disp_scores.len() {
+                disp_scores[i] += (target_scores[i] - disp_scores[i])
+                    * (1.0 - (-6.0 * dt as f64).exp());
+            }
             tb.draw(fb, fw, fh,
                     &format!("{} — {}", it.artist, it.title),
                     (16.0 * s) as i32, (14.0 * s) as i32, hud_px,
@@ -987,6 +1061,27 @@ fn play_item(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
                                 0x05070d, o);
                 tb.draw(fb, fw, fh, &sc_txt, sx, sy, score_px,
                         render::TEXT);
+                // secondary players — smaller right-aligned chips in
+                // track color under the lead score
+                if duet {
+                    for i in 1..tracks.len() {
+                        let name = if i == 1 && !it.singer2.is_empty() {
+                            it.singer2.clone()
+                        } else {
+                            tracks[i].clone()
+                        };
+                        let txt = format!(
+                            "{name}  {}",
+                            disp_scores[i].round() as i64);
+                        let w = tb.width(&txt, hud_px) as i32;
+                        let col = track_skin(i, true).0;
+                        let cy = sy + (48.0 * s) as i32
+                            + (i - 1) as i32 * (30.0 * s) as i32;
+                        tb.draw(fb, fw, fh, &txt,
+                                fw as i32 - (16.0 * s) as i32 - w,
+                                cy, hud_px, col);
+                    }
+                }
             }
             if cur_streak >= 2 {
                 tb.draw(fb, fw, fh, &format!("x{cur_streak}"),

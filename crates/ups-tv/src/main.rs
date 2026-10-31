@@ -55,6 +55,19 @@ fn resolve(args: &[String]) -> Option<PlayItem> {
     let audio_only = ["mp3", "m4a", "ogg", "wav", "flac"]
         .iter()
         .any(|e| name.ends_with(e));
+    // a duet chart claims every track — one singer still sees both
+    // lanes/lyric lines (the same voice scores both parts)
+    let tracks: Vec<String> = s
+        .chart
+        .as_ref()
+        .map(|p| {
+            ups_core::chart::load_chart(p)
+                .tracks
+                .keys()
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
     Some(PlayItem {
         id: 1,
         audio: audio.clone(),
@@ -64,7 +77,12 @@ fn resolve(args: &[String]) -> Option<PlayItem> {
         title: s.title,
         audio_only,
         singer: "you".into(),
-        tracks: vec!["P1".into()],
+        singer2: String::new(),
+        tracks: if tracks.is_empty() {
+            vec!["P1".into()]
+        } else {
+            tracks
+        },
         sync_offset: 0.0,
         lyrics_rom: std::env::var("UPS_ROMAJI")
             .map(|v| v != "0")

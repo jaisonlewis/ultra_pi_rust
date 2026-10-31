@@ -36,14 +36,32 @@ impl MicCapture {
     pub fn open_named(name: Option<&str>) -> Option<Self> {
         let host = cpal::default_host();
         let devs = host.input_devices().ok()?;
-        let mut opened = None;
         for dev in devs {
-            let dev_name = dev.name().unwrap_or_default();
             if let Some(want) = name {
-                if !dev_name.contains(want) {
+                if !dev.name().unwrap_or_default().contains(want) {
                     continue;
                 }
             }
+            if let Some(c) = Self::open_dev(dev) {
+                return Some(c);
+            }
+        }
+        None
+    }
+
+    /// Up to `want` captures — one per physical input device, in
+    /// enumeration order. Duets map track i to caps[i]; when fewer mics
+    /// than tracks are plugged in the caller reuses the last capture.
+    pub fn open_multi(want: usize) -> Vec<Self> {
+        let host = cpal::default_host();
+        let Ok(devs) = host.input_devices() else { return vec![] };
+        devs.filter_map(Self::open_dev).take(want.max(1)).collect()
+    }
+
+    /// Open one specific device — stream + detector worker.
+    fn open_dev(dev: cpal::Device) -> Option<Self> {
+        let mut opened = None;
+        for dev in std::iter::once(dev) {
             let Ok(cfg) = dev.default_input_config() else {
                 continue;
             };

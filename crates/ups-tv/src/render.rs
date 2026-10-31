@@ -91,7 +91,7 @@ pub fn lane_xy(geo: (i32, f64, f64, f64, f64), y: i32, h: i32,
 /// in detection break the ribbon (no phantom lines across silence).
 pub fn draw_trail(fb: &mut [u32], fw: usize, fh: usize,
                   log: &[(f64, i64)], pos_ms: f64, y: i32, h: i32,
-                  window_ms: f64) {
+                  window_ms: f64, under: u32, core: u32) {
     if log.len() < 2 {
         return;
     }
@@ -112,8 +112,8 @@ pub fn draw_trail(fb: &mut [u32], fw: usize, fh: usize,
                 let y0 = py.min(ty);
                 let hh = (py - ty).abs();
                 // wide soft underlay then bright core
-                rect(fb, fw, fh, x0, y0 - 3, w, hh + 7, TRAIL, 55);
-                rect(fb, fw, fh, x0, y0 - 1, w, hh + 3, TRAIL_GLOW,
+                rect(fb, fw, fh, x0, y0 - 3, w, hh + 7, under, 55);
+                rect(fb, fw, fh, x0, y0 - 1, w, hh + 3, core,
                      235);
             }
         }
@@ -184,7 +184,7 @@ pub fn draw_lane(fb: &mut [u32], fw: usize, fh: usize,
                  notes: &[Note], gap_ms: f64,
                  beat_ms: f64, pos_ms: f64, y: i32, h: i32,
                  window_ms: f64, sung: Option<i64>,
-                 hit_flash: bool) {
+                 hit_flash: bool, skin: (u32, u32)) {
     rect(fb, fw, fh, 0, y, fw as i32, h, LANE_BG, 150);
     let (playhead_x, px_per_ms, tone_min, tone_max, row_h) =
         lane_geo(fw, h, window_ms);
@@ -209,7 +209,7 @@ pub fn draw_lane(fb: &mut [u32], fw: usize, fh: usize,
             "golden" | "rapgolden" => (GOLDEN, true),
             "freestyle" => (FREESTYLE, false),
             "rap" => (0xc792ff, false),
-            _ => (NOTE, false),
+            _ => (skin.0, false),
         };
         rect(fb, fw, fh, x, ny, w, rh, color, 235);
         // gloss strip — top edge highlight, like the web pill sheen
@@ -229,8 +229,8 @@ pub fn draw_lane(fb: &mut [u32], fw: usize, fh: usize,
     if let Some(t) = sung {
         let row = (t as f64 - tone_min).clamp(0.0, tone_max - tone_min);
         let dy = y + h - 4 - ((row + 0.5) * row_h) as i32;
-        rect(fb, fw, fh, playhead_x - 9, dy - 8, 18, 16, SING_DOT, 60);
-        rect(fb, fw, fh, playhead_x - 6, dy - 5, 12, 10, SING_DOT, 255);
+        rect(fb, fw, fh, playhead_x - 9, dy - 8, 18, 16, skin.1, 60);
+        rect(fb, fw, fh, playhead_x - 6, dy - 5, 12, 10, skin.1, 255);
     }
     if hit_flash {
         rect(fb, fw, fh, 0, y, 6, h, GOLDEN, 200);

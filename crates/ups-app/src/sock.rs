@@ -75,11 +75,38 @@ impl ups_tv::Driver for App {
         };
         let p1 = self.st.performer(it.performer_id);
         let p2 = it.performer2_id.and_then(|id| self.st.performer(id));
-        let singer = match (p1, p2) {
+        let singer = match (&p1, &p2) {
             (Some(a), Some(b)) => format!("{} & {}", a.name, b.name),
-            (Some(a), None) => a.name,
+            (Some(a), None) => a.name.clone(),
             _ => String::new(),
         };
+        let singer2 = p2.map(|b| b.name).unwrap_or_default();
+        // claimed parts only — a solo singer on a duet chart gets just
+        // their chosen part; P2 lanes/mics appear only once someone
+        // joins the open slot (same rule as start_sing's track filter)
+        let lead = if it.part_choice.is_empty() {
+            "P1".to_string()
+        } else {
+            it.part_choice.clone()
+        };
+        let mut tracks: Vec<String> = [lead.as_str(), "P2"]
+            .iter()
+            .filter_map(|t| {
+                let t = t.to_string();
+                let claimed = t == lead
+                    || (it.performer2_id.is_some()
+                        && t != lead
+                        && e.tracks.contains(&t));
+                if claimed && e.tracks.contains(&t) {
+                    Some(t)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if tracks.is_empty() {
+            tracks = e.tracks.iter().take(1).cloned().collect();
+        }
         Some(ups_tv::PlayItem {
             id: it.id,
             audio,
@@ -89,7 +116,8 @@ impl ups_tv::Driver for App {
             title: e.title.clone(),
             audio_only: e.audio_only,
             singer,
-            tracks: e.tracks.clone(),
+            singer2,
+            tracks,
             sync_offset: self.st.sync_offset(it.entry_id),
             lyrics_rom: it.lyrics_rom.map(|v| v != 0).unwrap_or(false),
         })
