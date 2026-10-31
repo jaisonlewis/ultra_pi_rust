@@ -984,18 +984,18 @@ fn batch_one(args: &Args, song: &ups_core::catalog::Song) -> Result<bool> {
         Some(w) => w,
         None => {
             if !asr::have_models(&args.models) {
-                return Ok(false);
-            }
+                // the aligner picks records by heard-fraction — ASR is
+                // only the fuzzy-fallback's evidence, never required
+                Vec::new()
+            } else {
             let voc = song.dir.join(format!("{stem}.vocals.wav"));
             let stem_ref = voc.exists().then_some(voc.as_path());
-            let o = asr::transcribe_media(&song.media, stem_ref,
-                                          &args.models)?;
+            match asr::transcribe_media(&song.media, stem_ref,
+                                        &args.models) {
+            Ok(o) => {
             asr_lang = o.lang.clone();
             let w = o.words;
             say!("  asr: {} words ({})", w.len(), o.engine);
-            if w.len() < 20 {
-                return Ok(false);
-            }
             // refresh the sidecar so later batch runs reuse these
             if let Ok(bytes) = std::fs::read(&ana_path) {
                 if let Ok(mut j) =
@@ -1016,6 +1016,13 @@ fn batch_one(args: &Args, song: &ups_core::catalog::Song) -> Result<bool> {
                 }
             }
             w
+            }
+            Err(e) => {
+                say!("  asr failed: {e} — continuing without it");
+                Vec::new()
+            }
+            }
+            }
         }
     };
 
@@ -1075,20 +1082,37 @@ fn read_cached_asr(ana_path: &Path)
         -> Option<(Vec<asr::AsrWord>, Option<String>)> {
     let j: serde_json::Value =
         serde_json::from_slice(&std::fs::read(ana_path).ok()?).ok()?;
-    let engine = j["asr"]["engine"].as_str().unwrap_or("");
-    if !(engine.contains("parakeet") || engine.contains("whisper")) {
-        return None;
+    let asr = &j["asr"];
+    // rust sidecar: {"engine","lang","words_ms":[[ms,word],...]}
+    if let Some(words) = asr["words_ms"].as_array() {
+        let engine = asr["engine"].as_str().unwrap_or("");
+        if !(engine.contains("parakeet") || engine.contains("whisper")) {
+            return None;
+        }
+        let words = words.iter()
+            .filter_map(|w| {
+                Some(asr::AsrWord {
+                    start_ms: w[0].as_f64()?,
+                    end_ms: w[0].as_f64()?,
+                    word: w[1].as_str()?.to_string(),
+                })
+            }).collect();
+        let lang = asr["lang"].as_str().map(str::to_string);
+        return Some((words, lang));
     }
-    let words = j["asr"]["words_ms"].as_array()?.iter()
-        .filter_map(|w| {
-            Some(asr::AsrWord {
-                start_ms: w[0].as_f64()?,
-                end_ms: w[0].as_f64()?,
-                word: w[1].as_str()?.to_string(),
-            })
-        }).collect();
-    let lang = j["asr"]["lang"].as_str().map(str::to_string);
-    Some((words, lang))
+    // python sidecar: [[word, ms], ...] — flat pairs, word first
+    if let Some(words) = asr.as_array() {
+        let words = words.iter()
+            .filter_map(|w| {
+                Some(asr::AsrWord {
+                    word: w[0].as_str()?.to_string(),
+                    start_ms: w[1].as_f64()?,
+                    end_ms: w[1].as_f64()?,
+                })
+            }).collect();
+        return Some((words, None));
+    }
+    None
 }
 /// Cached lyric records from `<stem>.lyrics.json`.
 fn read_cached_lyrics(path: &Path)
