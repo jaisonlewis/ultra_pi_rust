@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use minifb::{Key, Window, WindowOptions};
+use minifb::{Key, ScaleMode, Window, WindowOptions};
 use rodio::{OutputStream, Sink, Source};
 use serde_json::{json, Value};
 use ups_core::chart::{self, Chart};
@@ -297,17 +297,27 @@ pub fn run(driver: Arc<dyn Driver>) -> Exit {
     }));
 
     let (w, h) = screen_size();
-    tlog!("screen {}x{}", w, h);
+    // The window spans the panel at its native mode while the buffer
+    // stays at render res — minifb's scale_mode does the upscale on
+    // present (EGL when it probes, linear otherwise), so a 720p render
+    // fills a 1080p TV the way console games do. Sizing the window to
+    // the render buffer must NOT be done: minifb pins min==max size on
+    // non-resizable windows, which makes compositor fullscreen
+    // impossible — that was the quarter-screen bug on labwc.
+    let (nw, nh) = native_size();
+    let (pw, ph) = (nw.max(w), nh.max(h));
+    tlog!("render {}x{} -> window {}x{}", w, h, pw, ph);
     let mut window = Window::new(
         // app_id — labwc fullscreens this via a windowRule; sizing the
         // window to the panel makes it fill the screen either way
         "ultra-pi-star",
-        w,
-        h,
+        pw,
+        ph,
         WindowOptions {
             resize: false,
             borderless: true,
             topmost: true,
+            scale_mode: ScaleMode::AspectRatioStretch,
             ..WindowOptions::default()
         },
     )
