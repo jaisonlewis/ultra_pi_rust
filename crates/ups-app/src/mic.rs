@@ -307,7 +307,10 @@ pub fn calibrate() -> Result<f64, String> {
     let mean = corr.iter().sum::<f32>() / n as f32;
     let var = corr.iter()
         .map(|&v| (v - mean) * (v - mean)).sum::<f32>() / n as f32;
-    let thr = mean + 6.0 * var.sqrt();
+    // 4σ + a small absolute floor — clicks under background audio
+    // correlate ~0.2-0.5 where silence gave ~0.9; consistency with the
+    // emitted pattern below is what actually validates them
+    let thr = (mean + 4.0 * var.sqrt()).max(0.12);
     let min_sep = (0.2 * sr) as usize;
     let mut order: Vec<usize> = (0..n).collect();
     order.sort_by(|&a, &b| corr[b].total_cmp(&corr[a]));
@@ -321,7 +324,7 @@ pub fn calibrate() -> Result<f64, String> {
         }
     }
     peaks.sort_unstable();
-    let best = peaks.iter().map(|&i| corr[i]).fold(0.0f32, f32::max);
+    let best = corr.iter().fold(0.0f32, |a, &v| a.max(v));
     eprintln!(
         "mic-cal: {} clicks above thr {thr:.3} (best corr {best:.3})",
         peaks.len()
