@@ -310,7 +310,9 @@ impl State {
         *self.history.get_mut().unwrap() = p.history;
         *self.next_performer.get_mut().unwrap() = p.next_performer.max(1);
         *self.next_queue_item.get_mut().unwrap() = p.next_queue_item.max(1);
-        *self.host_performer_id.get_mut().unwrap() = p.host_performer_id;
+        // a persisted host claim would outlive the phone that made it —
+        // the room reboots unhosted (badge shows the code again)
+        let _ = p.host_performer_id;
         *self.sync_offsets.get_mut().unwrap() = p.sync_offsets;
         if let Some(a) = p.autosync_mic {
             *self.autosync_mic.get_mut().unwrap() = a;

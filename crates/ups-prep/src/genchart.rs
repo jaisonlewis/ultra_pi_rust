@@ -14,6 +14,10 @@ const MIN_CONF: f64 = 0.35;
 const C2: f32 = 65.4064;
 
 type Asr = [(String, f64)];                     // (norm_word, start_ms)
+
+/// A held note can't outlast this — keeps instrumental melody absorbed
+/// into voiced runs from stretching a word across a whole solo.
+const MAX_HELD_MS: f64 = 8_000.0;
 type Spans = HashMap<usize, Span>;
 
 // ---- melody.rs ports ---------------------------------------------------
@@ -148,7 +152,11 @@ fn line_end(onset: f64, nxt: f64, ref_dur: f64,
             Some(m.map_or(b, |m| m.max(b)))
         });
     if let Some(r) = rend {
-        end = end.max(r.min(nxt - 50.0));
+        // runs include instrumental melody (sax/guitar solos fool the
+        // pitch tracker) — cap the extension so a solo can't stretch a
+        // held note across the whole bridge
+        end = end.max(r.min(nxt - 50.0)
+                      .min(onset + ref_dur + 4000.0));
     }
     end
 }
@@ -206,8 +214,10 @@ fn line_word_spans(line_text: &str, span: &Span,
         starts.push(t.max(starts.last().copied().unwrap_or(0.0)));
     }
     let ends: Vec<f64> = starts[1..].iter().copied()
-        .chain(std::iter::once((starts[starts.len() - 1] + 100.0)
-                               .max(span.end_ms)))
+        .chain(std::iter::once(((starts[starts.len() - 1] + 100.0)
+                                .max(span.end_ms))
+                               .min(starts[starts.len() - 1]
+                                    + MAX_HELD_MS)))
         .collect();
     words.iter().zip(&starts).zip(&ends)
         .map(|((w, s), e)| (w.to_string(), *s, *e))
@@ -227,7 +237,8 @@ fn asr_lines(asr: &Asr, gap_ms: f64,
             let li = texts.len() - 1;
             spans.insert(li, Span {
                 onset_ms: cur[0].1,
-                end_ms: run_end(cur.last().unwrap().1, runs),
+                end_ms: run_end(cur.last().unwrap().1, runs)
+                    .min(cur.last().unwrap().1 + MAX_HELD_MS),
                 cov: 1.0,
                 words: idxs.iter().copied().enumerate()
                     .map(|(p, a)| (p, a)).collect(),
@@ -245,7 +256,8 @@ fn asr_lines(asr: &Asr, gap_ms: f64,
         let li = texts.len() - 1;
         spans.insert(li, Span {
             onset_ms: cur[0].1,
-            end_ms: run_end(cur.last().unwrap().1, runs),
+            end_ms: run_end(cur.last().unwrap().1, runs)
+                    .min(cur.last().unwrap().1 + MAX_HELD_MS),
             cov: 1.0,
             words: idxs.iter().copied().enumerate()
                 .map(|(p, a)| (p, a)).collect(),
@@ -521,13 +533,28 @@ fn sung_spans(spans: &mut Spans, texts: &[String], times: &[f64],
                     .partial_cmp(&(b - pred).abs()).unwrap()) {
                 r
             } else {
-                let near = ons.iter()
-                    .any(|o| *o >= prev && (o - pred).abs() <= 4000.0);
-                if !near {
-                    dropped.push((li, pred, spans.remove(&li)));
-                    continue;
+                // no heard onset near the stamp: community LRCs often
+                // time repeated sections wrong (chorus 2 stamped at
+                // chorus 3's slot etc.) — when the line's own ASR
+                // match anchored it far from the stamp, trust the ASR
+                let asr_on = spans.get(&li)
+                    .filter(|s| s.words.len() >= 3
+                                && s.onset_ms >= prev
+                                && (s.onset_ms - pred).abs() > 3000.0)
+                    .map(|s| s.onset_ms);
+                match asr_on {
+                    Some(o) => o,
+                    None => {
+                        let near = ons.iter().any(|o| *o >= prev
+                            && (o - pred).abs() <= 4000.0);
+                        if !near {
+                            dropped.push((li, pred,
+                                          spans.remove(&li)));
+                            continue;
+                        }
+                        pred
+                    }
                 }
-                pred
             }
         };
         prev = onset + 100.0;
@@ -802,18 +829,29 @@ pub fn generate(artist: &str, title: &str,
     }
     let left_idx: Vec<usize> =
         (0..asr.len()).filter(|i| !used.contains(i)).collect();
-    if lyrics_kind.is_none() && left_idx.len() >= 3
-        && (spans.len() < 3 || used.len() < asr.len() / 2) {
+    // ASR gap-fill: words no lyric line claimed become lines of their
+    // own — LRC sources routinely drop ad-libs/bridge lines the singer
+    // actually sang, and empty gaps mid-song read as missing lyrics.
+    // When a lyric source matched, demand >=4 words per generated line
+    // so stray ASR hallucinations during instrumentals stay out.
+    let have_lyrics = lyrics_kind.is_some();
+    if left_idx.len() >= 3
+        && (!have_lyrics || spans.len() < 3 || used.len() < asr.len() / 2
+            || left_idx.len() >= 4) {
         let sub: Vec<(String, f64)> =
             left_idx.iter().map(|&i| asr[i].clone()).collect();
         let (t2, s2) = asr_lines(&sub, 1300.0, &runs);
-        let base = line_texts.len();
-        line_texts.extend(t2);
+        let mut base = line_texts.len();
         for (li, mut sp) in s2 {
+            if have_lyrics && t2[li].split_whitespace().count() < 4 {
+                continue;
+            }
+            line_texts.push(t2[li].clone());
             sp.asr_native = true;
             sp.words = sp.words.iter()
                 .map(|(p, a)| (*p, left_idx[*a])).collect();
-            spans.insert(base + li, sp);
+            spans.insert(base, sp);
+            base += 1;
         }
     }
     if spans.len() < 3 {
@@ -841,6 +879,39 @@ pub fn generate(artist: &str, title: &str,
         return None;
     }
     all_words.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+    // one voice per track — notes can't overlap. Two words sharing a
+    // start came from rival lines claiming the same window; keep the
+    // better-anchored one (real lyric match > interpolated > asr),
+    // and clamp any remaining tail-over-head overlap
+    let mut merged: Vec<(String, f64, f64, usize)> = Vec::new();
+    let rank = |li: usize, spans: &Spans| {
+        let s = &spans[&li];
+        (s.asr_native || s.interp, -(s.words.len() as i64))
+    };
+    for w in all_words.into_iter() {
+        let mut keep = true;
+        while keep {
+            let Some(last) = merged.last() else { break };
+            if (w.1 - last.1).abs() >= 60.0 || last.3 == w.3 {
+                break;
+            }
+            if rank(w.3, &spans) < rank(last.3, &spans) {
+                merged.pop();
+            } else {
+                keep = false;
+            }
+        }
+        if keep {
+            merged.push(w);
+        }
+    }
+    for i in 0..merged.len().saturating_sub(1) {
+        let nx = merged[i + 1].1;
+        if merged[i].2 > nx {
+            merged[i].2 = nx;
+        }
+    }
+    all_words = merged;
 
     // pitch per word
     let wn: Vec<Option<(i64, f64)>> = match curve {

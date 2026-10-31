@@ -540,74 +540,16 @@ fn prep(args: &Args) -> Result<()> {
         }
     }
 
-    // lyrics — gather candidate records, keep the one whose text best
-    // matches what the ASR actually heard (LRCLIB stubs and same-title
-    // different songs lose on word coverage, not on ordering)
+    // lyrics — provider fan-out, then the record whose text best
+    // matches what the ASR actually heard wins
     stage("fetching lyrics");
     let dur = ff::duration(&media).ok();
-    let mut recs: Vec<lyrics::LyricRecord> = Vec::new();
-    let cands = lyrics::yt_candidates(&artist, &title);
-    for (a, t) in &cands {
-        push_rec(lyrics::fetch(a, t, dur), &mut recs);
-    }
-    // alternates on the likeliest candidates — synclrc and lrcmux
-    // both carry synced LRC (synclrc covers Indian languages well,
-    // lrcmux fans out to deezer/musixmatch/etc itself)
-    for (a, t) in cands.iter().take(3) {
-        push_rec(lyrics::synclrc(a, t, dur), &mut recs);
-        push_rec(lyrics::lrcmux(a, t), &mut recs);
-    }
-    let q = format!("{artist} {title}").trim().to_string();
-    for r in lyrics::search(&q, dur) {
-        push_rec(Some(r), &mut recs);
-    }
-    // plain-text / search fallbacks when nothing synced landed —
-    // jiosaavn carries Indic lyrics + language tags, synclrc_search
-    // covers name variants the exact lookups missed
-    if recs.iter().all(|r| r.synced.is_empty()) {
-        for r in lyrics::jiosaavn(&q, dur) {
-            push_rec(Some(r), &mut recs);
-        }
-        if !cands.is_empty() {
-            let (a, t) = &cands[0];
-            push_rec(lyrics::ovh(a, t), &mut recs);
-        }
-        for r in lyrics::synclrc_search(&q, dur) {
-            push_rec(Some(r), &mut recs);
-        }
-    }
+    let recs = collect_lyrics(&artist, &title, dur);
     let asr_norm: Vec<(String, f64)> = wordmap::norm_asr(
         &asr_words.iter()
             .map(|w| (w.word.clone(), w.start_ms, w.end_ms))
             .collect::<Vec<_>>());
-    let rec = recs.iter()
-        .map(|r| {
-            let lines: Vec<String> = if r.synced.is_empty() {
-                r.plain.clone()
-            } else {
-                r.synced.iter().map(|(_, t)| t.clone()).collect()
-            };
-            let sp = wordmap::map_line_words(&asr_norm, &lines);
-            let used: usize = sp.values()
-                .map(|s| s.words.len()).sum();
-            (used, r)
-        })
-        .max_by_key(|(u, _)| *u)
-        .filter(|(u, _)| *u >= 3)
-        .map(|(_, r)| r.clone())
-        // foreign-language records score ~0 against a script-
-        // mismatched ASR — fall back to the synced record whose
-        // provider-reported duration agrees with the media
-        .or_else(|| recs.iter()
-            .filter(|r| !r.synced.is_empty())
-            .filter_map(|r| {
-                dur.and_then(|d| r.duration.map(|g| (g - d).abs()))
-                    .map(|delta| (delta, r))
-            })
-            .filter(|(delta, _)| *delta <= 4.0)
-            .min_by(|a, b| a.0.partial_cmp(&b.0)
-                .unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(_, r)| r.clone()));
+    let rec = pick_lyrics(&recs, &asr_norm, dur);
     if let Some(r) = &rec {
         say!("lyrics: {} synced / {} plain lines \
                   ({} — {}, {})",
@@ -749,6 +691,75 @@ fn push_rec(r: Option<lyrics::LyricRecord>,
     recs.push(r);
 }
 
+/// Provider fan-out — LRCLIB first, then the alternates on the
+/// likeliest candidates; plain-text/search fallbacks only when nothing
+/// synced landed. Shared by single-song and batch paths.
+fn collect_lyrics(artist: &str, title: &str, dur: Option<f64>)
+                 -> Vec<lyrics::LyricRecord> {
+    let mut recs: Vec<lyrics::LyricRecord> = Vec::new();
+    let cands = lyrics::yt_candidates(artist, title);
+    for (a, t) in &cands {
+        push_rec(lyrics::fetch(a, t, dur), &mut recs);
+    }
+    // alternates — synclrc covers Indian languages well; lrcmux fans
+    // out to deezer/musixmatch/etc itself
+    for (a, t) in cands.iter().take(3) {
+        push_rec(lyrics::synclrc(a, t, dur), &mut recs);
+        push_rec(lyrics::lrcmux(a, t), &mut recs);
+    }
+    let q = format!("{artist} {title}").trim().to_string();
+    for r in lyrics::search(&q, dur) {
+        push_rec(Some(r), &mut recs);
+    }
+    if recs.iter().all(|r| r.synced.is_empty()) {
+        // jiosaavn carries Indic lyrics + language tags, synclrc_search
+        // covers name variants the exact lookups missed
+        for r in lyrics::jiosaavn(&q, dur) {
+            push_rec(Some(r), &mut recs);
+        }
+        if let Some((a, t)) = cands.first() {
+            push_rec(lyrics::ovh(a, t), &mut recs);
+        }
+        for r in lyrics::synclrc_search(&q, dur) {
+            push_rec(Some(r), &mut recs);
+        }
+    }
+    recs
+}
+
+/// Keep the record whose text best matches what the ASR heard —
+/// LRCLIB stubs and same-title-different-song picks lose on word
+/// coverage. Foreign-language records score ~0 against a script-
+/// mismatched ASR: fall back to the synced record whose provider
+/// duration agrees with the media.
+fn pick_lyrics(recs: &[lyrics::LyricRecord],
+               asr_norm: &[(String, f64)], dur: Option<f64>)
+               -> Option<lyrics::LyricRecord> {
+    recs.iter()
+        .map(|r| {
+            let lines: Vec<String> = if r.synced.is_empty() {
+                r.plain.clone()
+            } else {
+                r.synced.iter().map(|(_, t)| t.clone()).collect()
+            };
+            let sp = wordmap::map_line_words(asr_norm, &lines);
+            (sp.values().map(|s| s.words.len()).sum::<usize>(), r)
+        })
+        .max_by_key(|(u, _)| *u)
+        .filter(|(u, _)| *u >= 3)
+        .map(|(_, r)| r.clone())
+        .or_else(|| recs.iter()
+            .filter(|r| !r.synced.is_empty())
+            .filter_map(|r| {
+                dur.and_then(|d| r.duration.map(|g| (g - d).abs()))
+                    .map(|delta| (delta, r))
+            })
+            .filter(|(delta, _)| *delta <= 4.0)
+            .min_by(|a, b| a.0.partial_cmp(&b.0)
+                .unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(_, r)| r.clone()))
+}
+
 /// `ups-prep batch --library <root>` — regenerate machine-made charts
 /// with the current ASR+pitch stack. Songs whose .upsong was imported
 /// (not marked ultrapibar-genchart/generated) are left alone.
@@ -869,43 +880,18 @@ fn batch_one(args: &Args, song: &ups_core::catalog::Song) -> Result<bool> {
         }
     };
 
-    // lyrics — best-matching record, same pick as single-song mode
+    // lyrics — same provider fan-out + ASR-coverage pick as
+    // single-song mode
     let dur = ff::duration(&song.media).ok();
-    let mut recs: Vec<lyrics::LyricRecord> = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for (a, t) in lyrics::yt_candidates(&artist, &title) {
-        if let Some(r) = lyrics::fetch(&a, &t, dur) {
-            if seen.insert(format!("{}|{}", r.artist_name, r.track_name)) {
-                recs.push(r);
-            }
-        }
-    }
-    let q = format!("{artist} {title}");
-    for r in lyrics::search(q.trim(), dur) {
-        if seen.insert(format!("{}|{}", r.artist_name, r.track_name)) {
-            recs.push(r);
-        }
-    }
+    let recs = collect_lyrics(&artist, &title, dur);
     let asr_norm: Vec<(String, f64)> = wordmap::norm_asr(
         &asr_words.iter()
             .map(|w| (w.word.clone(), w.start_ms, w.end_ms))
             .collect::<Vec<_>>());
-    let rec = recs.into_iter()
-        .map(|r| {
-            let lines: Vec<String> = if r.synced.is_empty() {
-                r.plain.clone()
-            } else {
-                r.synced.iter().map(|(_, t)| t.clone()).collect()
-            };
-            let sp = wordmap::map_line_words(&asr_norm, &lines);
-            (sp.values().map(|s| s.words.len()).sum::<usize>(), r)
-        })
-        .max_by_key(|(u, _)| *u)
-        .filter(|(u, _)| *u >= 3)
-        .map(|(_, r)| r);
+    let rec = pick_lyrics(&recs, &asr_norm, dur);
     if let Some(r) = &rec {
-        say!("  lyrics: {} synced lines ({} — {})",
-                 r.synced.len(), r.artist_name, r.track_name);
+        say!("  lyrics: {} synced lines ({} — {}, {})",
+                 r.synced.len(), r.artist_name, r.track_name, r.source);
     }
 
     Ok(gen_chart(args, &song.media, &artist, &title,
