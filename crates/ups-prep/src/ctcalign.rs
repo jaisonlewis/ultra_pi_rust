@@ -288,6 +288,79 @@ impl Aligner {
         (!out.is_empty()).then_some(out)
     }
 
+    /// Every vocab-token segmentation of `word` — the greedy split
+    /// isn't always the one the model emits (it may prefer a shorter
+    /// first piece, e.g. `▁o bs er er ved`), so low-confidence words
+    /// retry alternates. Each valid first piece gets its own budget
+    /// so a greedy-heavy branch can't starve the rest.
+    fn bpe_all(&self, word: &str) -> Vec<Vec<usize>> {
+        const LIMIT: usize = 32;
+        let s = format!("\u{2581}{word}");
+        let chars: Vec<char> = s.chars().collect();
+        let firsts: Vec<usize> = (1..=chars.len()).rev()
+            .filter(|&j| {
+                let piece: String = chars[..j].iter().collect();
+                self.vocab.contains_key(&piece)
+            })
+            .collect();
+        let per = (LIMIT / firsts.len().max(1)).max(3);
+        let mut out = Vec::new();
+        for j in firsts {
+            let piece: String = chars[..j].iter().collect();
+            let mut bag = Vec::new();
+            let mut acc = vec![self.vocab[&piece]];
+            self.bpe_dfs(&chars, j, &mut acc, &mut bag, per);
+            out.extend(bag);
+            if out.len() >= LIMIT {
+                break;
+            }
+        }
+        out
+    }
+
+    fn bpe_dfs(&self, chars: &[char], i: usize, acc: &mut Vec<usize>,
+               bag: &mut Vec<Vec<usize>>, cap: usize) {
+        if bag.len() >= cap {
+            return;
+        }
+        if i == chars.len() {
+            bag.push(acc.clone());
+            return;
+        }
+        for j in (i + 1..=chars.len()).rev() {
+            let piece: String = chars[i..j].iter().collect();
+            if let Some(&id) = self.vocab.get(&piece) {
+                acc.push(id);
+                self.bpe_dfs(chars, j, acc, bag, cap);
+                acc.pop();
+            }
+        }
+        if chars[i] != '\u{2581}' {
+            self.bpe_dfs(chars, i + 1, acc, bag, cap);
+        }
+    }
+
+    /// All segmentations worth trying for one lyric word.
+    fn tokenize_candidates(&self, word: &str) -> Vec<Vec<usize>> {
+        let clean: String = word.chars()
+            .filter(|c| c.is_alphanumeric() || *c == '\u{27}')
+            .collect();
+        if clean.is_empty() {
+            return Vec::new();
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for c in [clean.clone(), clean.to_lowercase()] {
+            for ids in self.bpe_all(&c) {
+                if seen.insert(ids.clone()) {
+                    out.push(ids);
+                }
+            }
+        }
+        out.truncate(24);
+        out
+    }
+
     /// Lines of lyric text → aligned words.
     pub fn align(&self, lp: &LogProbs, lines: &[String]) -> Vec<AlignedWord> {
         let mut words: Vec<WordSpec> = Vec::new();
@@ -302,8 +375,124 @@ impl Aligner {
                 }
             }
         }
-        viterbi(lp, &words, self.blank, self.space, self.frame_ms)
+        let mut out = viterbi(lp, &words, self.blank, self.space,
+                              self.frame_ms);
+        // resegment low-confidence words: alternate tokenizations are
+        // scored on the same span and the winner re-times the word
+        if self.backend == Backend::ParakeetCtc {
+            for x in out.iter_mut() {
+                if x.conf >= 0.5 {
+                    continue;
+                }
+                let cands = self.tokenize_candidates(&x.text);
+                if cands.len() <= 1 {
+                    continue;
+                }
+                let f0 = ((x.start_ms / self.frame_ms) as usize)
+                    .saturating_sub(6);
+                let f1 = ((x.end_ms / self.frame_ms) as usize + 6)
+                    .min(lp.frames);
+                let mut best: Option<(f32, usize, usize)> = None;
+                for ids in &cands {
+                    if let Some(r) = span_align(lp, ids, f0, f1,
+                                                self.blank) {
+                        if best.map_or(true, |b| r.0 > b.0) {
+                            best = Some(r);
+                        }
+                    }
+                }
+                if let Some((sc, first, last)) = best {
+                    if sc > x.conf {
+                        x.conf = sc;
+                        x.start_ms = (f0 + first) as f64 * self.frame_ms;
+                        x.end_ms = ((f0 + last + 1) as f64
+                                        * self.frame_ms)
+                            .min(lp.frames as f64 * self.frame_ms);
+                    }
+                }
+            }
+        }
+        out
     }
+}
+
+/// Force-align one token sequence inside lp[f0..f1]. Returns
+/// (mean token probability, first token frame, last token frame).
+fn span_align(lp: &LogProbs, ids: &[usize], f0: usize, f1: usize,
+              blank: usize) -> Option<(f32, usize, usize)> {
+    if f1 <= f0 + ids.len() + 2 {
+        return None;
+    }
+    // states: leading blank, then TOK BLANK per token
+    let mut kinds = vec![false];            // false = blank, true = tok
+    let mut toks = vec![blank];
+    for &t in ids {
+        kinds.push(true);
+        toks.push(t);
+        kinds.push(false);
+        toks.push(blank);
+    }
+    let s_n = kinds.len();
+    let preds: Vec<Vec<usize>> = (0..s_n).map(|s| {
+        let mut p = vec![s];
+        // identical adjacent tokens can't emit on successive frames
+        if s > 0 && !(kinds[s] && kinds[s - 1] && toks[s] == toks[s - 1]) {
+            p.push(s - 1);
+        }
+        let mut k = s as isize - 1;
+        for _ in 0..3 {
+            if k <= 0 || kinds[k as usize] {
+                break;
+            }
+            k -= 1;
+            if kinds[k as usize] {
+                p.push(k as usize);
+                break;
+            }
+        }
+        p
+    }).collect();
+    let t_n = f1 - f0;
+    let mut dp = vec![f32::NEG_INFINITY; s_n];
+    let mut arg = vec![0u8; s_n * t_n];
+    dp[0] = lp.at(f0, blank);
+    for t in 1..t_n {
+        let mut nd = vec![f32::NEG_INFINITY; s_n];
+        for s in 0..s_n {
+            let mut best = f32::NEG_INFINITY;
+            let mut bi = 0usize;
+            for &p in &preds[s] {
+                if dp[p] > best {
+                    best = dp[p];
+                    bi = p;
+                }
+            }
+            if best > f32::NEG_INFINITY {
+                nd[s] = best + lp.at(f0 + t, toks[s]);
+            }
+            arg[t * s_n + s] = bi as u8;
+        }
+        dp = nd;
+    }
+    let s_end = if dp[s_n - 1] >= dp[s_n - 2] { s_n - 1 } else { s_n - 2 };
+    let (mut first, mut last, mut score, mut ntok) =
+        (usize::MAX, 0usize, 0f32, 0usize);
+    let mut s = s_end;
+    for t in (1..t_n).rev() {
+        if kinds[s] {
+            score += lp.at(f0 + t, toks[s]);
+            ntok += 1;
+            if ntok == 1 {
+                last = t;
+            }
+            first = t;              // backtracing down → smallest wins
+        }
+        s = arg[t * s_n + s] as usize;
+    }
+    if ntok == 0 || first == usize::MAX {
+        return None;
+    }
+    Some(((score / ntok as f32).exp(), first, last))
 }
 
 struct WordSpec {
