@@ -48,7 +48,11 @@ pitch detection math, manifest + folder library discovery, audit —
 - `ups-app` — the party server: REST + socket.io contract the existing
   `web/` frontend consumes unchanged (phone remote, host controls,
   mic volume/mix, queue, search, scores), `ups-state.json` recovery,
-  PipeWire mic→speaker monitor on PipeWire systems.
+  PipeWire mic→speaker monitor on PipeWire systems. Real mic-delay
+  calibration (matched-filter click correlation, persisted and
+  applied to scoring), and per-entry sync offsets invalidate
+  automatically when a chart file changes — recharted songs can't
+  inherit stale nudges.
 - `ups-tv` — the native screen: ffmpeg-decoded video + karaoke lyrics,
   pitch lane, sung-tone trail, hit sparks, rating pops, eased score,
   streak badges, results confetti, animated idle. `--tv` runs it
@@ -57,9 +61,11 @@ pitch detection math, manifest + folder library discovery, audit —
 - `ups-prep` — the prep station: YouTube URL or local file →
   normalized media, vocal-cut `.inst.mp4`, vocal stem, artwork,
   analysis sidecar, and a `.upsong` chart — imported + chroma-aligned
-  when you supply one, or *generated from scratch* (ASR word timing +
-  RMVPE pitch) when you don't. Straight into a stick folder the player
-  scans.
+  when you supply one, or *generated from scratch* by **CTC forced
+  alignment** (the lyric text is Viterbi-aligned against the vocal
+  stem's acoustic-model posteriors — no dependence on how badly ASR
+  would transcribe singing) plus RMVPE pitch. Straight into a stick
+  folder the player scans.
 
 Not yet: duet per-mic routing, autosync (station charts are
 GAP-corrected so plain GAP works).
@@ -79,7 +85,11 @@ ups-prep <youtube-url | media-file> --library <stick root> [opts]
 ups-prep batch --library <root>   re-chart a whole library: walks
   every song, regenerates .upsongs that were machine-generated
   (or missing), and leaves imported/human charts untouched.
-  A stored parakeet transcript is reused so repeats are fast.
+  Charts already made by the aligner (source.lyrics "ctc-*") skip
+  automatically, so interrupted sweeps resume; --force redoes them.
+  --shard N --shards M partitions the library for parallel workers.
+  Fetched lyric records cache to <stem>.lyrics.json so re-runs skip
+  the provider HTTP fan-out.
 
 ups-prep --gui                    native window form (song URL/file,
                                   library + models pickers, batch
@@ -118,6 +128,10 @@ models/
   sherpa-onnx-spleeter-2stems-int8/        separation models
   sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/   ASR model
   rmvpe.onnx                               melody extraction
+  sherpa-onnx-nemo-parakeet_tdt_ctc_110m-en-36000-int8/
+                                           CTC aligner (English)
+  sherpa-onnx-omnilingual-asr-1600-languages-300M-ctc-v2-int8-*/
+                                           CTC aligner (multilingual)
 ```
 
 Binaries resolve from `models/bin/` (if you lay them out yourself),
@@ -155,13 +169,22 @@ artifacts), the raw media audio is tried automatically. The Python
 prep station uses faster-whisper `large-v3-turbo`; both are fine —
 charts are interchangeable either way.
 
-Chart generation (`genchart.rs`, a port of `genchart.py`): synced
-LRCLIB lyrics are placed by a global LRC→media shift that lands line
-onsets on heard-word onsets, then snapped to real phrase starts;
-unmatched lyrics interpolate between anchored neighbours; words the
-pitch curve can't confirm become `freestyle` notes instead of
-pitch-scored ones. Everything bakes to absolute media milliseconds
-(`BPM=15000`), so generated charts need no runtime warp.
+Chart generation (`genchart.rs` + `ctcalign.rs`; `genchart.py` +
+`ctcalign.py` on the Python side — one algorithm, two ports): every
+candidate lyric record's text is **forced-aligned against the vocal
+stem** — the CTC models (parakeet-ctc-110m for English, omnilingual
+300M for other languages) run in-process via ONNX Runtime, emitting
+frame log-posteriors in 30 s stitched windows. A Viterbi pass with
+`<*>` skip states between lines places each word at ~80 ms resolution
+and yields a per-word confidence; the record whose words the model
+actually *heard* wins (≥35 % gate). Word onsets then snap to
+spectral-flux vocal onsets, ends are voicing-bounded and capped
+(never crossing the next word, never holding through solos), and
+low-confidence words retry alternate BPE tokenizations before
+accepting their score. Everything bakes to absolute media
+milliseconds (`BPM=15000`), so generated charts need no runtime warp.
+The older ASR text-matching generator remains as the no-models
+fallback; aligned charts carry `lyrics: "ctc-<backend>"` provenance.
 
 Without the models the pipeline still runs — media, artwork, analysis,
 imported-chart alignment — just no `.inst.mp4`, no vocal stem, and no
@@ -177,6 +200,11 @@ tool degrades gracefully when absent.
 | Raspberry Pi (labwc/Wayland) | `cargo build --release -p ups-app` | fullscreen + 720p out via `scripts/pi-display.sh` (installs the `ultra-pi-star` labwc windowRule + autostart); PipeWire mic monitor active; renders at 720p by default (`UPS_RENDER_RES=0` for native) |
 | Windows | `cargo build --release -p ups-tv` | works today; `ffmpeg.exe` on PATH; windowed 1280×720 (no /sys probe) — Esc quits |
 | macOS | `cargo build --release -p ups-tv` | `brew install ffmpeg`; build natively on the Mac (no practical cross-compile); fonts auto-resolve to Helvetica |
+
+Tagged releases (`v*`) build `ups-win-x64`, `ups-linux-x64` and
+`ups-macos-arm64` bundles automatically — see
+`.github/workflows/release.yml`; `workflow_dispatch` can run it
+manually.
 
 Runtime deps: `ffmpeg` on PATH (video). Optional on Linux only:
 `pw-loopback`/`wpctl`/`pw-dump` for the speaker mic monitor — without
