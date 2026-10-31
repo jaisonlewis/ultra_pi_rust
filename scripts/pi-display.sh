@@ -2,7 +2,10 @@
 # Pi display defaults for the native TV renderer:
 #   - labwc windowRule fullscreens the `ultra-pi-star` surface (Wayland
 #     clients can't self-fullscreen through minifb — the compositor must)
-#   - HDMI out at 1280x720@60 so the panel's own scaler does the upscale
+#   - HDMI out at the panel's preferred mode — the app renders a fixed
+#     720p buffer and the compositor stretches it fullscreen; forcing a
+#     non-native mode hands the upscale to the display's own scaler,
+#     which some panels/projectors zoom or overscan badly
 # Idempotent — safe to re-run; only touches what it owns.
 set -e
 
@@ -35,17 +38,26 @@ fi
 as="$HOME/.config/labwc/autostart"
 [ -f "$as" ] || printf '#!/bin/sh\n' > "$as"
 chmod +x "$as"
-if ! grep -q 'wlr-randr' "$as"; then
-    sed -i '1a\
-# 720p HDMI out — the panel'"'"'s hardware scaler upscales, and every pixel\
-# of framebuffer work on the Pi costs ~4x less than 1080p.\
+# (re)install our block — marker-delimited so re-runs replace instead of
+# stacking, and so it also replaces the old forced-720p line
+sed -i '/# ups-display begin/,/# ups-display end/d' "$as"
+sed -i '1a\
+# ups-display begin\
+# output at the panel'"'"'s preferred mode — the app renders a fixed 720p\
+# buffer and the compositor stretches it fullscreen. Forcing a non-native\
+# mode hands the upscale to the display'"'"'s own scaler, which some\
+# panels and projectors zoom or overscan badly.\
 out=$(wlr-randr 2>/dev/null | awk '"'"'/^HDMI|^eDP|^LVDS/{print $1; exit}'"'"')\
-[ -n "$out" ] \&\& wlr-randr --output "$out" --mode 1280x720@60 2>/dev/null &' "$as"
-fi
+mode=$(wlr-randr 2>/dev/null | awk '"'"'/\(preferred/{print $1; exit}'"'"')\
+[ -n "$out" ] \&\& [ -n "$mode" ] \&\&\
+  wlr-randr --output "$out" --mode "$mode" 2>/dev/null &\
+# ups-display end' "$as"
 grep -q 'start ups-app' "$as" || echo 'systemctl --user start ups-app' >> "$as"
 
 # live-apply if a session is already running
-wlr-randr --output HDMI-A-1 --mode 1280x720@60 2>/dev/null || true
+out=$(wlr-randr 2>/dev/null | awk '/^HDMI|^eDP|^LVDS/{print $1; exit}')
+mode=$(wlr-randr 2>/dev/null | awk '/\(preferred/{print $1; exit}')
+[ -n "$out" ] && [ -n "$mode" ] && wlr-randr --output "$out" --mode "$mode" 2>/dev/null || true
 labwc -r 2>/dev/null || labwc --reconfigure 2>/dev/null || true
 
-echo "pi-display: fullscreen windowRule + 720p autostart installed"
+echo "pi-display: fullscreen windowRule + preferred-mode autostart installed"
