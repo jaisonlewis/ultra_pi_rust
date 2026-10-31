@@ -195,6 +195,27 @@ pub struct SessionCookie {
     pub is_host: bool,
 }
 
+/// A singer's saved voice-FX profile — travels with the performer, not
+/// the room. Mirrors Python db.performer_fx (sparse set of FX_KEYS);
+/// defaults match monitor globals when a key was never customized.
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct FxProfile {
+    /// semitone shift, -12..+12
+    #[serde(default)]
+    pub pitch: f64,
+    /// 0..1 correction strength
+    #[serde(default)]
+    pub autotune: f64,
+    #[serde(default)]
+    pub polish: bool,
+    /// 0..1 echo mix
+    #[serde(default)]
+    pub echo_wet: f64,
+    /// 0..1 early-reflection mix
+    #[serde(default)]
+    pub reverb_wet: f64,
+}
+
 #[derive(Default, Serialize, Deserialize)]
 struct Persisted {
     performers: Vec<Performer>,
@@ -219,6 +240,23 @@ struct Persisted {
     /// music the singer was actually hearing
     #[serde(default)]
     mic_delay_ms: Option<f64>,
+    /// performer_id -> saved voice FX — follows the singer between
+    /// songs and across restarts (Python performer_fx:<id> settings)
+    #[serde(default)]
+    performer_fx: BTreeMap<i64, FxProfile>,
+    /// room monitor + music levels — persisted so a reboot doesn't
+    /// slam sliders back to defaults
+    #[serde(default)]
+    mic_volume: Option<f64>,
+    #[serde(default)]
+    mic_muted: Option<bool>,
+    #[serde(default)]
+    mic_echo_ms: Option<i64>,
+    #[serde(default)]
+    music_volume: Option<f64>,
+    /// room-default voice FX for sessions with no performer identity
+    #[serde(default)]
+    room_fx: FxProfile,
 }
 
 pub struct State {
@@ -256,6 +294,16 @@ pub struct State {
     /// calibrated speaker->mic loop delay, subtracted from the media
     /// position at scoring ticks (persisted)
     pub mic_delay_ms: Mutex<f64>,
+    /// performer_id -> saved voice FX profile (persisted)
+    pub performer_fx: Mutex<BTreeMap<i64, FxProfile>>,
+    /// persisted room monitor/music levels — Monitor + App seed from
+    /// these at boot, POST /api/mic + /api/playback/volume write back
+    pub mic_volume: Mutex<f64>,
+    pub mic_muted: Mutex<bool>,
+    pub mic_echo_ms: Mutex<i64>,
+    pub music_volume: Mutex<f64>,
+    /// room-default voice FX (no performer identity on the session)
+    pub room_fx: Mutex<FxProfile>,
 }
 
 #[derive(Clone)]
@@ -299,6 +347,12 @@ impl State {
             autosync_mic: Mutex::new(true),
             output_target: Mutex::new(None),
             mic_delay_ms: Mutex::new(40.0),
+            performer_fx: Mutex::new(BTreeMap::new()),
+            mic_volume: Mutex::new(0.8),
+            mic_muted: Mutex::new(false),
+            mic_echo_ms: Mutex::new(120),
+            music_volume: Mutex::new(1.0),
+            room_fx: Mutex::new(FxProfile::default()),
         };
         st.restore();
         st
@@ -348,6 +402,20 @@ impl State {
         if let Some(d) = p.mic_delay_ms {
             *self.mic_delay_ms.get_mut().unwrap() = d;
         }
+        *self.performer_fx.get_mut().unwrap() = p.performer_fx;
+        if let Some(v) = p.mic_volume {
+            *self.mic_volume.get_mut().unwrap() = v;
+        }
+        if let Some(m) = p.mic_muted {
+            *self.mic_muted.get_mut().unwrap() = m;
+        }
+        if let Some(e) = p.mic_echo_ms {
+            *self.mic_echo_ms.get_mut().unwrap() = e;
+        }
+        if let Some(v) = p.music_volume {
+            *self.music_volume.get_mut().unwrap() = v;
+        }
+        *self.room_fx.get_mut().unwrap() = p.room_fx;
     }
 
     pub fn persist(&self) {
@@ -369,11 +437,18 @@ impl State {
         let autosync_mic = Some(*self.autosync_mic.lock().unwrap());
         let output_target = self.output_target.lock().unwrap().clone();
         let mic_delay_ms = Some(*self.mic_delay_ms.lock().unwrap());
+        let performer_fx = self.performer_fx.lock().unwrap().clone();
+        let mic_volume = Some(*self.mic_volume.lock().unwrap());
+        let mic_muted = Some(*self.mic_muted.lock().unwrap());
+        let mic_echo_ms = Some(*self.mic_echo_ms.lock().unwrap());
+        let music_volume = Some(*self.music_volume.lock().unwrap());
+        let room_fx = self.room_fx.lock().unwrap().clone();
         let p = Persisted {
             performers, queue, history, next_performer,
             next_queue_item, host_performer_id, sync_offsets,
             sync_offset_charts, autosync_mic, output_target,
-            mic_delay_ms,
+            mic_delay_ms, performer_fx, mic_volume, mic_muted,
+            mic_echo_ms, music_volume, room_fx,
         };
         let path = self.state_path.read().unwrap().clone();
         let tmp = path.with_extension("tmp");
@@ -588,6 +663,37 @@ impl State {
 
     pub fn performer(&self, id: i64) -> Option<Performer> {
         self.performers.lock().unwrap().iter().find(|p| p.id == id).cloned()
+    }
+
+    /// Saved voice FX for a performer — None until they've customized.
+    pub fn performer_fx(&self, id: i64) -> Option<FxProfile> {
+        self.performer_fx.lock().unwrap().get(&id).cloned()
+    }
+
+    /// Store a performer's merged FX profile + persist.
+    pub fn set_performer_fx(&self, id: i64, fx: &FxProfile) {
+        *self.performer_fx.lock().unwrap().entry(id).or_default() =
+            fx.clone();
+        self.persist();
+    }
+
+    /// Persist room monitor levels (POST /api/mic room fields).
+    pub fn set_mic_levels(&self, volume: f64, muted: bool, echo_ms: i64) {
+        *self.mic_volume.lock().unwrap() = volume;
+        *self.mic_muted.lock().unwrap() = muted;
+        *self.mic_echo_ms.lock().unwrap() = echo_ms;
+        self.persist();
+    }
+
+    pub fn set_music_volume(&self, v: f64) {
+        *self.music_volume.lock().unwrap() = v;
+        self.persist();
+    }
+
+    /// Room-default voice FX (POST /api/mic fx with no identity).
+    pub fn set_room_fx(&self, fx: &FxProfile) {
+        *self.room_fx.lock().unwrap() = fx.clone();
+        self.persist();
     }
 
     // -- queue --------------------------------------------------------------

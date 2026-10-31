@@ -18,6 +18,11 @@ pub struct SingCtx {
     pub session: Session,
     _mic: Option<MicSession>,
     pub tones: std::sync::Arc<Mutex<BTreeMap<String, Option<i64>>>>,
+    /// track -> capture device name — lets /api/mic find the mic a
+    /// performer is singing into mid-song (monitor src_fx key)
+    pub track_device: BTreeMap<String, String>,
+    /// track -> performer — saved FX profiles load onto their device
+    pub track_performer: BTreeMap<String, i64>,
     pub last_ms: f64,
     /// entry the session scores — sync offsets persist against it
     pub entry_id: i64,
@@ -354,10 +359,35 @@ fn begin_sing(app: &App, item: &QueueItem, entry: &Entry) -> bool {
             ))
         });
     let ok = mic.is_some();
+    // each claimed part belongs to a performer — their saved voice FX
+    // loads onto the device scoring them (Python pipeline _src_fx)
+    let mut track_performer = BTreeMap::new();
+    track_performer.insert(lead.to_string(), item.performer_id);
+    if let Some(p2) = item.performer2_id {
+        let t2 = if lead == "P1" { "P2" } else { "P1" };
+        if tracks.iter().any(|t| t == t2) {
+            track_performer.insert(t2.to_string(), p2);
+        }
+    }
+    let track_device = mic
+        .as_ref()
+        .map(|m| m.track_device.clone())
+        .unwrap_or_default();
+    if let Some(mon) = app.monitor.as_ref() {
+        for (t, dev) in &track_device {
+            if let Some(pid) = track_performer.get(t) {
+                if let Some(fx) = app.st.performer_fx(*pid) {
+                    mon.set_source_fx(dev, &fx);
+                }
+            }
+        }
+    }
     *app.sing.lock().unwrap() = Some(SingCtx {
         session,
         _mic: mic,
         tones,
+        track_device,
+        track_performer,
         last_ms: 0.0,
         entry_id: entry.id,
         lyrics_rom: item.lyrics_rom.map(|v| v != 0).unwrap_or(false),

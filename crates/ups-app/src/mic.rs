@@ -13,6 +13,8 @@ use ups_core::pitch::PitchDetector;
 pub struct MicSession {
     /// track -> latest detected absolute tone (None = no confident pitch)
     pub tones: Arc<Mutex<BTreeMap<String, Option<i64>>>>,
+    /// track -> capture device name serving it (monitor src_fx key)
+    pub track_device: BTreeMap<String, String>,
     stop: Arc<std::sync::atomic::AtomicBool>,
     _streams: Vec<cpal::Stream>,
     workers: Vec<JoinHandle<()>>,
@@ -35,6 +37,9 @@ fn open_dev(dev: cpal::Device)
     }
     let shared = Arc::new(Mutex::new(VecDeque::<i16>::new()));
     let cfg_stream: cpal::StreamConfig = cfg.clone().into();
+    // mono downmix — pipewire presents stereo nodes; interleaved
+    // frames corrupt the detector's analysis window
+    let ch = cfg.channels().max(1) as usize;
     let err_fn = |e: cpal::StreamError| eprintln!("mic error: {e}");
     let stream = match cfg.sample_format() {
         cpal::SampleFormat::I16 => {
@@ -43,7 +48,7 @@ fn open_dev(dev: cpal::Device)
                 &cfg_stream,
                 move |data: &[i16], _: &cpal::InputCallbackInfo| {
                     let mut g = buf.lock().unwrap();
-                    g.extend(data.iter().copied());
+                    g.extend(data.chunks(ch).map(|f| f[0]));
                     while g.len() > 8192 {
                         g.pop_front();
                     }
@@ -56,8 +61,8 @@ fn open_dev(dev: cpal::Device)
                 &cfg_stream,
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
                     let mut g = buf.lock().unwrap();
-                    g.extend(data.iter().map(|&s| {
-                        (s.clamp(-1.0, 1.0) * 32767.0) as i16
+                    g.extend(data.chunks(ch).map(|f| {
+                        (f[0].clamp(-1.0, 1.0) * 32767.0) as i16
                     }));
                     while g.len() > 8192 {
                         g.pop_front();
@@ -104,6 +109,7 @@ impl MicSession {
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut streams = Vec::with_capacity(n);
         let mut workers = Vec::with_capacity(n);
+        let mut track_device = BTreeMap::new();
         for (i, (stream, shared, rate, name)) in
             caps.into_iter().enumerate()
         {
@@ -114,6 +120,9 @@ impl MicSession {
             } else {
                 vec![tracks[i].clone()]
             };
+            for t in &mine {
+                track_device.insert(t.clone(), name.clone());
+            }
             eprintln!("mic: {name} @ {rate} Hz -> {}", mine.join("+"));
             let (tones_w, stop_w) =
                 (Arc::clone(&tones), Arc::clone(&stop));
@@ -146,6 +155,7 @@ impl MicSession {
         }
         Some(MicSession {
             tones,
+            track_device,
             stop,
             _streams: streams,
             workers,

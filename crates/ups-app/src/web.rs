@@ -854,6 +854,7 @@ async fn api_pb_volume(AxState(app): AxState<Arc<App>>, headers: HeaderMap,
     };
     let vol = vol.clamp(0.0, 1.0);
     *app.music_volume.lock().unwrap() = vol;
+    app.st.set_music_volume(vol);
     let _ = app.io.emit("player:volume", &json!(vol)).await;
     Json(json!({"ok": true, "music_volume": vol})).into_response()
 }
@@ -1049,6 +1050,12 @@ async fn api_mic(AxState(app): AxState<Arc<App>>, headers: HeaderMap)
     let (sid, _) = ensure_sid(&app, &headers);
     let capturing = app.sing.lock().unwrap().is_some();
     let mon = app.monitor.as_ref();
+    let fx = mon.map(|m| m.fx.lock().unwrap().clone()).unwrap_or_default();
+    // sliders show the caller's saved profile when the session carries
+    // a performer identity — it travels with the singer, not the room
+    let my_fx = sess(&app, &sid)
+        .performer_id
+        .and_then(|pid| app.st.performer_fx(pid));
     Json(json!({
         "capture": capturing,
         "monitor": mon.is_some(),
@@ -1058,9 +1065,10 @@ async fn api_mic(AxState(app): AxState<Arc<App>>, headers: HeaderMap)
         "error": "",
         "volume": mon.map(|m| *m.volume.lock().unwrap()).unwrap_or(0.0),
         "echo_ms": mon.map(|m| *m.echo_ms.lock().unwrap()).unwrap_or(0),
-        "echo_wet": 0, "pitch": 0,
-        "reverb_wet": 0, "autotune": 0, "polish": false,
-        "my_fx": null,
+        "echo_wet": fx.echo_wet, "pitch": fx.pitch,
+        "reverb_wet": fx.reverb_wet, "autotune": fx.autotune,
+        "polish": fx.polish,
+        "my_fx": my_fx,
         "muted": mon.map(|m| *m.muted.lock().unwrap()).unwrap_or(true),
         "passthrough": mon.is_some(),
         "mic_delay_ms": *app.st.mic_delay_ms.lock().unwrap(),
@@ -1070,8 +1078,10 @@ async fn api_mic(AxState(app): AxState<Arc<App>>, headers: HeaderMap)
 }
 
 /// POST /api/mic — live monitor controls (host or current singer).
-/// Volume/mute ride on the loopback's playback node via wpctl; voice
-/// FX fields are accepted for compatibility but inert for now.
+/// Volume/mute ride on the loopback's playback node via wpctl. Voice
+/// FX belong to the caller's performer profile when they have one —
+/// merged, persisted, and applied to the mic serving them now — else
+/// they ride the room default (Python api.mic_set semantics).
 async fn api_mic_set(AxState(app): AxState<Arc<App>>, headers: HeaderMap,
                      Json(body): Json<Value>)
     -> impl IntoResponse {
@@ -1095,16 +1105,85 @@ async fn api_mic_set(AxState(app): AxState<Arc<App>>, headers: HeaderMap,
         body["muted"].as_bool(),
         body["echo_ms"].as_i64(),
     );
+    if body.get("volume").is_some()
+        || body.get("muted").is_some()
+        || body.get("echo_ms").is_some()
+    {
+        app.st.set_mic_levels(
+            *mon.volume.lock().unwrap(),
+            *mon.muted.lock().unwrap(),
+            *mon.echo_ms.lock().unwrap(),
+        );
+    }
+
+    // FX keys the phone sends — 'reverb' spells reverb_wet
+    let has_fx = ["pitch", "autotune", "polish", "echo_wet",
+                  "reverb", "reverb_wet"]
+        .iter()
+        .any(|k| body.get(k).is_some());
+    let mut my_fx = serde_json::Value::Null;
+    if has_fx {
+        let pid = sess(&app, &sid).performer_id;
+        let mut prof = pid
+            .and_then(|p| app.st.performer_fx(p))
+            .unwrap_or_else(|| mon.fx.lock().unwrap().clone());
+        if let Some(v) = body["pitch"].as_f64() {
+            prof.pitch = v.clamp(-12.0, 12.0);
+        }
+        if let Some(v) = body["autotune"].as_f64() {
+            prof.autotune = v.clamp(0.0, 1.0);
+        }
+        if let Some(v) = body["polish"].as_bool() {
+            prof.polish = v;
+        }
+        if let Some(v) = body["echo_wet"].as_f64() {
+            prof.echo_wet = v.clamp(0.0, 1.0);
+        }
+        if let Some(v) = body["reverb_wet"]
+            .as_f64()
+            .or_else(|| body["reverb"].as_f64())
+        {
+            prof.reverb_wet = v.clamp(0.0, 1.0);
+        }
+        if let Some(pid) = pid {
+            // identified singer: save to their profile and apply it
+            // to the mic scoring them right now
+            app.st.set_performer_fx(pid, &prof);
+            if let Some(dev) = perf_device(&app, pid) {
+                mon.set_source_fx(&dev, &prof);
+            }
+            my_fx = serde_json::to_value(&prof).unwrap_or_default();
+        } else {
+            mon.set_fx(&prof);
+            app.st.set_room_fx(&prof);
+        }
+    }
+
+    let fx = mon.fx.lock().unwrap().clone();
     Json(json!({
         "ok": true,
         "volume": *mon.volume.lock().unwrap(),
         "echo_ms": *mon.echo_ms.lock().unwrap(),
-        "echo_wet": 0, "pitch": 0, "reverb_wet": 0,
-        "autotune": 0, "polish": false,
-        "my_fx": null,
+        "echo_wet": fx.echo_wet, "pitch": fx.pitch,
+        "reverb_wet": fx.reverb_wet,
+        "autotune": fx.autotune, "polish": fx.polish,
+        "my_fx": my_fx,
         "muted": *mon.muted.lock().unwrap(),
     }))
     .into_response()
+}
+
+/// The capture device a performer is singing into right now —
+/// performer -> claimed track -> device (None between songs).
+fn perf_device(app: &App, pid: i64) -> Option<String> {
+    let sing = app.sing.lock().unwrap();
+    let s = sing.as_ref()?;
+    let track = s
+        .track_performer
+        .iter()
+        .find(|(_, p)| **p == pid)?
+        .0;
+    s.track_device.get(track).cloned()
 }
 
 /// POST /api/mic/calibrate — play clicks through the output, matched-

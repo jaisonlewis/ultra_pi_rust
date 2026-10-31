@@ -9,8 +9,11 @@
 //! Volume/mute ride on the loopback's playback node via wpctl — same
 //! mechanism Python's _apply_loopback_state uses.
 
+use std::collections::HashMap;
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
+
+use crate::state::FxProfile;
 
 const OUTPUT_NODE: &str = "output.ups-monitor";
 
@@ -19,11 +22,17 @@ pub struct Monitor {
     pub volume: Mutex<f64>,
     pub muted: Mutex<bool>,
     pub echo_ms: Mutex<i64>,
+    /// room-default voice FX (no performer identity on the session)
+    pub fx: Mutex<FxProfile>,
+    /// device name -> active singer's profile — set when their queue
+    /// item starts so their saved sound loads onto their mic
+    pub src_fx: Mutex<HashMap<String, FxProfile>>,
 }
 
 /// Spawn the loopback. Returns None where PipeWire tools don't exist
 /// (dev machines) — scoring capture keeps working without it.
-pub fn start() -> Option<Monitor> {
+/// `init` carries the persisted room levels + room FX from state.
+pub fn start(init: (f64, bool, i64, FxProfile)) -> Option<Monitor> {
     // orphaned loopbacks from previous runs survive us — they double
     // the monitored mic and pile up ~8 MB each. Our own argv doesn't
     // contain "ups-monitor" so this can't self-match.
@@ -40,9 +49,11 @@ pub fn start() -> Option<Monitor> {
     eprintln!("monitor: pw-loopback ups-monitor running");
     Some(Monitor {
         child,
-        volume: Mutex::new(0.8),
-        muted: Mutex::new(false),
-        echo_ms: Mutex::new(120),
+        volume: Mutex::new(init.0),
+        muted: Mutex::new(init.1),
+        echo_ms: Mutex::new(init.2),
+        fx: Mutex::new(init.3),
+        src_fx: Mutex::new(HashMap::new()),
     })
 }
 
@@ -60,6 +71,35 @@ impl Monitor {
             *self.echo_ms.lock().unwrap() = e.clamp(0, 600);
         }
         self.apply();
+    }
+
+    /// Room-default voice FX (sessions with no performer identity).
+    /// Stored for the DSP chain and echoed back through /api/mic;
+    /// merging here keeps untouched keys at their saved values.
+    pub fn set_fx(&self, fx: &FxProfile) {
+        *self.fx.lock().unwrap() = fx.clone();
+    }
+
+    /// A singer's saved profile lands on the device serving them —
+    /// per-mic overrides sit above the room defaults (Python _src_fx).
+    pub fn set_source_fx(&self, device: &str, fx: &FxProfile) {
+        self.src_fx
+            .lock()
+            .unwrap()
+            .insert(device.to_string(), fx.clone());
+    }
+
+    /// Effective FX for a device: its singer's profile where set,
+    /// room defaults for anything they never customized. Read by the
+    /// DSP chain once it lands (Python MicMonitor.fx_for).
+    #[allow(dead_code)]
+    pub fn fx_for(&self, device: &str) -> FxProfile {
+        self.src_fx
+            .lock()
+            .unwrap()
+            .get(device)
+            .cloned()
+            .unwrap_or_else(|| self.fx.lock().unwrap().clone())
     }
 
     /// Push current volume+mute onto the loopback's playback node.

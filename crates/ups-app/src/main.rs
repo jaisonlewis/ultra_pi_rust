@@ -141,8 +141,16 @@ fn main() {
             .stderr(std::process::Stdio::null())
             .status();
     }
-    // mic passthrough — singers hear themselves (PipeWire only)
-    let mon = monitor::start();
+    // mic passthrough — singers hear themselves (PipeWire only);
+    // seeded with the persisted room levels + room FX so a restart
+    // doesn't slam anyone's settings back to defaults
+    let mon = monitor::start((
+        *st.mic_volume.lock().unwrap(),
+        *st.mic_muted.lock().unwrap(),
+        *st.mic_echo_ms.lock().unwrap(),
+        st.room_fx.lock().unwrap().clone(),
+    ));
+    let saved_music_volume = *st.music_volume.lock().unwrap();
     // restore the host's saved audio output (sink_name survives
     // restarts where wpctl ids don't)
     if let Some(saved) = st.output_target.lock().unwrap().clone() {
@@ -179,7 +187,7 @@ fn main() {
                 join_url,
                 sing: Mutex::new(None),
                 tv_sid: Mutex::new(None),
-                music_volume: Mutex::new(1.0),
+                music_volume: Mutex::new(saved_music_volume),
                 auto_next: Mutex::new(0.0),
                 native_tv,
                 paused: std::sync::atomic::AtomicBool::new(false),
