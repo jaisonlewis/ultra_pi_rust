@@ -169,8 +169,11 @@ impl Drop for MicSession {
 pub fn calibrate() -> Result<f64, String> {
     const N_CLICKS: usize = 4;
     const CLICK_MS: f64 = 30.0;
-    const GAP_MS: f64 = 350.0;
     const LEAD_MS: f64 = 500.0;
+    // nonuniform gaps — a periodic pattern lets onsets pair with the
+    // wrong emits (delay ambiguous modulo the spacing); irregular
+    // spacing makes only the true alignment cluster
+    const GAPS_S: [f64; N_CLICKS] = [0.35, 0.55, 0.30, 0.45];
 
     // buffer raw capture with arrival times — weak room pickup defeats
     // energy thresholds but not correlation
@@ -240,13 +243,12 @@ pub fn calibrate() -> Result<f64, String> {
         .map(|i| ((2.0 * std::f64::consts::PI * 1000.0 * i as f64 / sr)
                       .sin() * 32767.0 * 0.9) as i16)
         .collect();
-    let gap_len = (sr * GAP_MS / 1000.0) as usize;
     let mut buf = vec![0i16; (sr * LEAD_MS / 1000.0) as usize];
     let mut offsets = Vec::new();
-    for _ in 0..N_CLICKS {
+    for &gap in &GAPS_S {
         offsets.push(buf.len());
         buf.extend_from_slice(&click);
-        buf.resize(buf.len() + gap_len, 0);
+        buf.resize(buf.len() + (sr * gap) as usize, 0);
     }
 
     // play through the default output — the same sink routing songs
@@ -339,16 +341,39 @@ pub fn calibrate() -> Result<f64, String> {
     }).collect();
     let emits: Vec<f64> = offsets.iter()
         .map(|&o| o as f64 / sr).collect();
-    let gap_s = GAP_MS / 1000.0;
-    let mut delays: Vec<f64> = emits.iter().filter_map(|&e| {
-        onset.iter()
-            .find(|&&t| t >= e && t <= e + gap_s)
-            .map(|&t| t - e)
-    }).collect();
-    delays.retain(|&d| (0.0..=2.0).contains(&d));
-    delays.sort_by(|a, b| a.total_cmp(b));
-    if delays.is_empty() {
+    // pair every onset with every emit — the true latency repeats once
+    // per real (click, emit) pair while noise pairings scatter, so the
+    // largest ~30ms cluster wins. No assumption that the delay fits
+    // inside the click gap (HDMI+pipewire can exceed it).
+    let mut cands: Vec<f64> = Vec::new();
+    for &t in &onset {
+        for &e in &emits {
+            let d = t - e;
+            if (0.0..=2.0).contains(&d) {
+                cands.push(d);
+            }
+        }
+    }
+    cands.sort_by(|a, b| a.total_cmp(b));
+    let mut best: &[f64] = &[];
+    let mut i = 0;
+    while i < cands.len() {
+        let mut j = i + 1;
+        while j < cands.len() && cands[j] - cands[j - 1] < 0.03 {
+            j += 1;
+        }
+        if j - i > best.len() {
+            best = &cands[i..j];
+        }
+        i = j;
+    }
+    eprintln!(
+        "mic-cal: {} delay candidates, best cluster {}",
+        cands.len(),
+        best.len()
+    );
+    if best.len() < 2 {
         return Err("no clicks heard — is the volume up?".into());
     }
-    Ok(delays[delays.len() / 2] * 1000.0)
+    Ok(best[best.len() / 2] * 1000.0)
 }
