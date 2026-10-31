@@ -47,7 +47,9 @@ impl StreamingSource {
             .find(|t| {
                 t.codec_params.codec
                     != symphonia::core::codecs::CODEC_TYPE_NULL
-                    && t.codec_params.sample_rate.is_some()
+                    && t.codec_params
+                        .sample_rate
+                        .is_some_and(|r| r > 0)
             })
             .cloned()
             .ok_or("no audio track")?;
@@ -73,13 +75,19 @@ impl StreamingSource {
     }
 
     /// Seconds of audio if the container knows the frame count.
+    /// `rate` 0 (reported by some malformed streams) would give inf —
+    /// `Duration::from_secs_f64(inf)` panics, so this must return None.
     pub fn duration(&self) -> Option<f64> {
+        if self.rate == 0 {
+            return None;
+        }
         self.format
             .tracks()
             .iter()
             .find(|t| t.id == self.track_id)
             .and_then(|t| t.codec_params.n_frames)
             .map(|n| n as f64 / self.rate as f64)
+            .filter(|d| d.is_finite() && *d > 0.0)
     }
 
     /// Pull + decode the next packet into `buf`. Returns false at EOF.
@@ -145,6 +153,7 @@ impl Source for StreamingSource {
         self.rate
     }
     fn total_duration(&self) -> Option<Duration> {
-        self.duration().map(Duration::from_secs_f64)
+        self.duration()
+            .and_then(|d| Duration::try_from_secs_f64(d).ok())
     }
 }
