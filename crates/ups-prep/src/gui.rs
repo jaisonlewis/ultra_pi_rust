@@ -3,7 +3,7 @@
 //! opens it. Wraps the same `prep`/`run_batch` entry points the CLI
 //! uses; progress lines arrive over the `say!` tee.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver};
 
 use eframe::egui;
@@ -18,6 +18,106 @@ enum Job {
     Search,
     Batch,
     Models,
+}
+
+// -- persisted prefs ---------------------------------------------------------
+
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct Prefs {
+    library: String,
+    models: String,
+    guide: f32,
+    no_separate: bool,
+    hevc: bool,
+}
+
+fn prefs_path() -> PathBuf {
+    #[cfg(windows)]
+    let base = std::env::var("APPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."));
+    #[cfg(not(windows))]
+    let base = std::env::var("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|_| {
+            std::env::var("HOME")
+                .map(|h| PathBuf::from(h).join(".config"))
+        })
+        .unwrap_or_else(|_| PathBuf::from("."));
+    base.join("ultra-pi-star").join("prep-gui.json")
+}
+
+fn load_prefs() -> Prefs {
+    std::fs::read_to_string(prefs_path())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_prefs(app: &PrepApp) {
+    let p = Prefs {
+        library: app.library.clone(),
+        models: app.models.clone(),
+        guide: app.guide,
+        no_separate: app.no_separate,
+        hevc: app.hevc,
+    };
+    if let Ok(s) = serde_json::to_string(&p) {
+        let path = prefs_path();
+        if let Some(d) = path.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        let _ = std::fs::write(path, s);
+    }
+}
+
+// -- first-run setup status ---------------------------------------------------
+
+/// One checklist row's state.
+struct Step {
+    ok: bool,
+    detail: String,
+}
+
+/// What the pipeline actually checks for under the models dir —
+/// keeps the checklist honest instead of "does the dir exist".
+fn model_step(models_dir: &str) -> Step {
+    let m = Path::new(models_dir);
+    let mut missing: Vec<&str> = Vec::new();
+    if !crate::separate::have_models(m) {
+        missing.push("vocal separation");
+    }
+    if !crate::ctcalign::have_model(m) {
+        missing.push("lyric aligner");
+    }
+    if !crate::rmvpe::have_model(m) {
+        missing.push("pitch model");
+    }
+    let sherpa = crate::models::find_bin(
+        m,
+        if cfg!(windows) {
+            "sherpa-onnx-offline.exe"
+        } else {
+            "sherpa-onnx-offline"
+        },
+    )
+    .is_some();
+    if !sherpa {
+        missing.push("sherpa binaries");
+    }
+    if missing.is_empty() {
+        Step { ok: true, detail: "ready".into() }
+    } else {
+        Step { ok: false, detail: format!("missing {}", missing.join(", ")) }
+    }
+}
+
+fn tool_on_path(name: &str) -> bool {
+    std::process::Command::new(name)
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 pub fn run() -> anyhow::Result<()> {
@@ -52,12 +152,23 @@ struct PrepApp {
     status: String,
     log: std::collections::VecDeque<String>,
     rx: Option<Receiver<String>>,
+    // setup checklist caches — the spawn-a-process checks are too
+    // slow to run every frame
+    tools: Option<(bool, bool)>,        // yt-dlp, ffmpeg on PATH
+    model_status: Option<Step>,         // recomputed on dir/job change
+    saved_sig: String,                  // last persisted prefs fingerprint
+    setup_open: bool,                   // user manually toggled the card
 }
 
 impl Default for PrepApp {
     fn default() -> Self {
-        let models = std::env::var("UPS_MODELS_DIR")
-            .unwrap_or_else(|_| "models".into());
+        let prefs = load_prefs();
+        let models = if prefs.models.is_empty() {
+            std::env::var("UPS_MODELS_DIR")
+                .unwrap_or_else(|_| "models".into())
+        } else {
+            prefs.models
+        };
         let sel = crate::models::load_packs(
             std::path::Path::new(&models));
         let mut packs: Vec<(String, bool)> = crate::models::ASR_PACKS
@@ -70,14 +181,14 @@ impl Default for PrepApp {
         PrepApp {
             source: String::new(),
             queue: String::new(),
-            library: String::new(),
+            library: prefs.library,
             models,
             artist: String::new(),
             title: String::new(),
             chart: String::new(),
-            guide: 0.15,
-            no_separate: false,
-            hevc: false,
+            guide: prefs.guide.max(0.0),
+            no_separate: prefs.no_separate,
+            hevc: prefs.hevc,
             search: String::new(),
             hits: Vec::new(),
             packs,
@@ -85,6 +196,10 @@ impl Default for PrepApp {
             status: String::new(),
             log: std::collections::VecDeque::new(),
             rx: None,
+            tools: None,
+            model_status: None,
+            saved_sig: String::new(),
+            setup_open: false,
         }
     }
 }
@@ -112,7 +227,11 @@ impl PrepApp {
                 .filter(|s| !s.is_empty()),
             dl_models: false,
             batch,
+            shard: 0,
+            shards: 1,
+            align_diag: false,
             gui: false,
+            force: false,
         }
     }
 
@@ -122,6 +241,16 @@ impl PrepApp {
         self.rx = Some(rx);
         self.busy = true;
         self.status = "working…".into();
+        // missing models don't hard-fail (prep degrades gracefully),
+        // but a first-timer should know *why* output is limited
+        if matches!(job, Job::Prep | Job::Queue | Job::Batch) {
+            let s = self.model_step();
+            if !s.ok {
+                self.log.push_back(format!(
+                    "note: {} — output will be limited; 'Download \
+                     models' fetches the full pack", s.detail));
+            }
+        }
         let args = self.args(matches!(job, Job::Batch));
         let queue_urls: Vec<String> = self.queue.lines()
             .flat_map(|l| l.split_whitespace())
@@ -177,6 +306,127 @@ impl PrepApp {
         }
     }
 
+    fn models_dir(&self) -> String {
+        if self.models.trim().is_empty() {
+            "models".into()
+        } else {
+            self.models.trim().to_string()
+        }
+    }
+
+    /// Fingerprint of the persisted fields — a change means the prefs
+    /// file is stale and gets rewritten.
+    fn prefs_sig(&self) -> String {
+        format!("{}|{}|{}|{}|{}", self.library.trim(),
+                self.models.trim(), self.guide,
+                self.no_separate, self.hevc)
+    }
+
+    fn model_step(&mut self) -> Step {
+        if self.model_status.is_none() {
+            self.model_status = Some(model_step(&self.models_dir()));
+        }
+        Step {
+            ok: self.model_status.as_ref().unwrap().ok,
+            detail: self.model_status.as_ref().unwrap().detail.clone(),
+        }
+    }
+
+    /// One checklist row: ✓/✗ marker, step name, detail, action.
+    fn step_row(ui: &mut egui::Ui, n: usize, name: &str, s: &Step,
+                add_contents: impl FnOnce(&mut egui::Ui)) {
+        ui.horizontal(|ui| {
+            let (mark, col) = if s.ok {
+                ("✔", egui::Color32::from_rgb(60, 180, 90))
+            } else {
+                ("✗", egui::Color32::from_rgb(220, 80, 70))
+            };
+            ui.label(egui::RichText::new(mark).color(col).strong());
+            ui.label(format!("{n}. {name}"));
+            ui.label(egui::RichText::new(&s.detail).weak());
+            add_contents(ui);
+        });
+    }
+
+    /// The first-run checklist — shown expanded until every step is
+    /// green, then collapses into a one-line "setup complete" strip
+    /// that can be reopened.
+    fn setup_card(&mut self, ui: &mut egui::Ui) {
+        if self.tools.is_none() {
+            self.tools = Some((tool_on_path("yt-dlp"),
+                               tool_on_path("ffmpeg")));
+        }
+        let (ytdlp, ffmpeg) = self.tools.unwrap();
+        let tools = Step {
+            ok: ytdlp && ffmpeg,
+            detail: if ytdlp && ffmpeg {
+                "yt-dlp + ffmpeg on PATH".into()
+            } else {
+                let mut m: Vec<&str> = Vec::new();
+                if !ytdlp { m.push("yt-dlp"); }
+                if !ffmpeg { m.push("ffmpeg"); }
+                format!("install {} and relaunch", m.join(" + "))
+            },
+        };
+        let lib = Step {
+            ok: !self.library.trim().is_empty()
+                && Path::new(self.library.trim()).is_dir(),
+            detail: if self.library.trim().is_empty() {
+                "pick the folder prepared songs go into".into()
+            } else if Path::new(self.library.trim()).is_dir() {
+                self.library.trim().to_string()
+            } else {
+                "folder does not exist".into()
+            },
+        };
+        let models = self.model_step();
+        let all_ok = tools.ok && lib.ok && models.ok;
+
+        if all_ok && !self.setup_open {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("✔ setup complete")
+                    .color(egui::Color32::from_rgb(60, 180, 90)));
+                if ui.small_button("show").clicked() {
+                    self.setup_open = true;
+                }
+            });
+            return;
+        }
+
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Getting started")
+                    .strong());
+                if all_ok && ui.small_button("hide").clicked() {
+                    self.setup_open = false;
+                }
+            });
+            Self::step_row(ui, 1, "Tools", &tools, |_| {});
+            Self::step_row(ui, 2, "Library folder", &lib, |ui| {
+                if ui.small_button("Browse…").clicked() {
+                    if let Some(p) =
+                            rfd::FileDialog::new().pick_folder() {
+                        self.library = p.display().to_string();
+                    }
+                }
+            });
+            Self::step_row(ui, 3, "AI models (~900 MB)", &models, |ui| {
+                if !models.ok {
+                    let b = ui.add_enabled(!self.busy,
+                        egui::Button::new("Download models").small());
+                    if b.clicked() {
+                        self.start(Job::Models);
+                    }
+                }
+            });
+            if !all_ok {
+                ui.label(egui::RichText::new(
+                    "finish these, then paste a song or playlist \
+                     link below").weak().italics());
+            }
+        });
+    }
+
     fn field(ui: &mut egui::Ui, label: &str, s: &mut String,
              hint: &str,
              browse: Option<fn() -> Option<PathBuf>>) {
@@ -211,6 +461,8 @@ impl eframe::App for PrepApp {
                     self.status = "done".into();
                     crate::set_log_sink(None);
                     self.log.push_back("— finished —".into());
+                    // a Models job just wrote new files — recheck
+                    self.model_status = None;
                 } else if let Some(e) = m.strip_prefix(ERR) {
                     self.busy = false;
                     self.status = format!("failed: {e}");
@@ -238,6 +490,14 @@ impl eframe::App for PrepApp {
                 std::time::Duration::from_millis(100));
         }
 
+        // persist library/models/options the moment they change —
+        // a first-timer shouldn't retype paths on relaunch
+        let sig = self.prefs_sig();
+        if sig != self.saved_sig {
+            save_prefs(self);
+            self.saved_sig = sig;
+        }
+
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if self.busy {
@@ -255,6 +515,9 @@ impl eframe::App for PrepApp {
                  the library folder as a complete stick-format entry \
                  (karaoke video, chart, art).",
             );
+            ui.add_space(6.0);
+
+            self.setup_card(ui);
             ui.add_space(6.0);
 
             let can_act = !self.busy;
