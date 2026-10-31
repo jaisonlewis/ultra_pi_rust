@@ -1010,10 +1010,20 @@ fn batch_one(args: &Args, song: &ups_core::catalog::Song) -> Result<bool> {
         }
     };
 
-    // lyrics — same provider fan-out + ASR-coverage pick as
-    // single-song mode
+    // lyrics — cached beside the media after the first fetch so
+    // batch re-runs skip the provider fan-out entirely; an empty
+    // result is never cached (providers may recover later)
     let dur = ff::duration(&song.media).ok();
-    let recs = collect_lyrics(&artist, &title, dur);
+    let lyr_path = song.media.with_extension("lyrics.json");
+    let recs = read_cached_lyrics(&lyr_path).unwrap_or_else(|| {
+        let r = collect_lyrics(&artist, &title, dur);
+        if !r.is_empty() {
+            if let Ok(j) = serde_json::to_string_pretty(&r) {
+                let _ = std::fs::write(&lyr_path, j);
+            }
+        }
+        r
+    });
     let asr_norm: Vec<(String, f64)> = wordmap::norm_asr(
         &asr_words.iter()
             .map(|w| (w.word.clone(), w.start_ms, w.end_ms))
@@ -1071,6 +1081,13 @@ fn read_cached_asr(ana_path: &Path)
     let lang = j["asr"]["lang"].as_str().map(str::to_string);
     Some((words, lang))
 }
+/// Cached lyric records from `<stem>.lyrics.json`.
+fn read_cached_lyrics(path: &Path)
+        -> Option<Vec<lyrics::LyricRecord>> {
+    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+        .filter(|v: &Vec<lyrics::LyricRecord>| !v.is_empty())
+}
+
 /// Cached rmvpe curve from `<stem>.analysis.json` — the sidecar
 /// already stores f0/conf/hop, so batch recharts skip the expensive
 /// pitch pass entirely.
@@ -1139,7 +1156,9 @@ fn aligned_chart(args: &Args, audio16: &[f32], artist: &str,
     };
     let mut best: Option<(f32, Vec<ctcalign::AlignedWord>,
                           Vec<String>, &lyrics::LyricRecord)> = None;
-    for r in recs {
+    // candidates arrive roughly best-first; a >=80% heard record is
+    // a decisive win — stop burning Viterbi passes on the rest
+    for r in recs.iter().take(4) {
         let lines = align_lines(r);
         let n_words: usize = lines.iter()
             .map(|l| l.split_whitespace().count()).sum();
@@ -1154,6 +1173,9 @@ fn aligned_chart(args: &Args, audio16: &[f32], artist: &str,
                  r.source, lines.len(), n_words, frac * 100.0);
         if best.as_ref().is_none_or(|b| frac > b.0) {
             best = Some((frac, w, lines, r));
+        }
+        if frac >= 0.80 {
+            break;
         }
     }
     let Some((frac, words, lines, r)) = best else { return false };

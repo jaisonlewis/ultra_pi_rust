@@ -13,7 +13,8 @@ const API: &str = "https://lrclib.net/api/get";
 const SEARCH_API: &str = "https://lrclib.net/api/search";
 const UA: &str = "UltraPiStar/1.0 (https://github.com/)";
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize,
+         serde::Deserialize)]
 pub struct LyricRecord {
     /// (ms, text) synced lines
     pub synced: Vec<(i64, String)>,
@@ -27,7 +28,7 @@ pub struct LyricRecord {
     /// fallback when ASR word-coverage can't score a foreign record
     pub duration: Option<f64>,
     /// which provider returned this record (lrclib/synclrc/…)
-    pub source: &'static str,
+    pub source: String,
 }
 
 #[derive(Deserialize)]
@@ -201,7 +202,7 @@ fn record(d: LrcHit) -> Option<LyricRecord> {
         artist_name: d.artist_name.unwrap_or_default(),
         lang: None,
         duration: d.duration,
-        source: "lrclib",
+        source: "lrclib".into(),
     })
 }
 
@@ -274,7 +275,7 @@ pub fn synclrc(artist: &str, title: &str, dur: Option<f64>)
             track_name: h.track.unwrap_or_else(|| title.to_string()),
             artist_name: h.artist.unwrap_or_else(|| artist.to_string()),
             duration: h.duration,
-            source: "synclrc",
+            source: "synclrc".into(),
             synced,
             lang: None,
         });
@@ -328,7 +329,7 @@ pub fn synclrc_search(query: &str, dur: Option<f64>)
                 synced, plain, has_word_sync: false,
                 track_name: h.track.unwrap_or_default(),
                 artist_name: h.artist.unwrap_or_default(),
-                duration: h.duration, source: "synclrc", lang: None,
+                duration: h.duration, source: "synclrc".into(), lang: None,
             })
         })
         .collect()
@@ -350,7 +351,7 @@ pub fn lrcmux(artist: &str, title: &str) -> Option<LyricRecord> {
         has_word_sync: false,
         track_name: title.to_string(),
         artist_name: artist.to_string(),
-        source: "lrcmux",
+        source: "lrcmux".into(),
         synced,
         lang: None,
         duration: None,
@@ -378,7 +379,7 @@ pub fn ovh(artist: &str, title: &str) -> Option<LyricRecord> {
     Some(LyricRecord {
         synced: Vec::new(), plain, has_word_sync: false,
         track_name: title.to_string(), artist_name: artist.to_string(),
-        lang: None, duration: None, source: "ovh",
+        lang: None, duration: None, source: "ovh".into(),
     })
 }
 
@@ -426,7 +427,7 @@ pub fn jiosaavn(query: &str, dur: Option<f64>) -> Vec<LyricRecord> {
                     .unwrap_or_default(),
                 lang: h.language,
                 duration: h.duration.and_then(|d| d.parse().ok()),
-                source: "jiosaavn",
+                source: "jiosaavn".into(),
             }
         })
         .collect()
