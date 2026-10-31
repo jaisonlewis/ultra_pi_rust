@@ -255,7 +255,7 @@ fn fetch(url: &str, dest: &Path, label: &str) -> Result<()> {
 
 fn untar(archive: &Path, into: &Path, label: &str) -> Result<()> {
     let st = Command::new("tar")
-        .args(["-xjf"])
+        .arg("-xf")
         .arg(archive)
         .arg("-C")
         .arg(into)
@@ -265,6 +265,137 @@ fn untar(archive: &Path, into: &Path, label: &str) -> Result<()> {
         bail!("{label}: tar extraction failed (need bsdtar — ships \
                with Windows 10+ and every unix)");
     }
+    Ok(())
+}
+
+/// Find `names` anywhere under `root` and copy them into `dest`.
+/// Archive layouts differ per OS — this doesn't care.
+fn copy_bins(root: &Path, dest: &Path, names: &[&str]) -> Result<()> {
+    let mut left: Vec<String> =
+        names.iter().map(|s| s.to_string()).collect();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d)?.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+                continue;
+            }
+            let Some(n) = p.file_name().and_then(|s| s.to_str())
+                .map(str::to_string) else { continue };
+            if let Some(i) = left.iter().position(|x| *x == n) {
+                std::fs::copy(&p, dest.join(&n))
+                    .with_context(||
+                        format!("extract {} -> {}", p.display(),
+                                dest.display()))?;
+                left.remove(i);
+            }
+        }
+    }
+    if left.is_empty() {
+        Ok(())
+    } else {
+        bail!("extract: {} not found in archive", left.join(", "))
+    }
+}
+
+#[cfg(unix)]
+fn make_exec(p: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(
+        p, std::fs::Permissions::from_mode(0o755));
+}
+
+/// Prepend `<models>/bin/` to the process PATH so bare
+/// `Command::new("yt-dlp")`/`ffmpeg`/`ffprobe` find the tools
+/// `fetch_tools` put there. Safe to call repeatedly.
+pub fn add_bin_to_path(models: &Path) {
+    let bindir = models.join("bin");
+    let Ok(abs) = bindir.canonicalize() else { return };
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let mut parts: Vec<PathBuf> =
+        std::env::split_paths(&path).collect();
+    if !parts.iter().any(|p| p == &abs) {
+        parts.insert(0, abs);
+        if let Ok(joined) = std::env::join_paths(parts) {
+            std::env::set_var("PATH", joined);
+        }
+    }
+}
+
+/// Download the external tools the pipeline shells out to — yt-dlp
+/// and ffmpeg/ffprobe — into `<models>/bin/`. Static builds, no
+/// installer, no admin. Idempotent.
+pub fn fetch_tools(models: &Path) -> Result<()> {
+    let bindir = models.join("bin");
+    std::fs::create_dir_all(&bindir)?;
+    let tmp = models.join(".dl-tmp");
+    std::fs::create_dir_all(&tmp)?;
+
+    let exe = if cfg!(windows) { ".exe" } else { "" };
+
+    let yt = bindir.join(format!("yt-dlp{exe}"));
+    if yt.exists() {
+        say!("yt-dlp: present, skipping");
+    } else {
+        let name = if cfg!(windows) {
+            "yt-dlp.exe"
+        } else if cfg!(target_os = "macos") {
+            "yt-dlp_macos"
+        } else {
+            "yt-dlp"
+        };
+        fetch(&format!("https://github.com/yt-dlp/yt-dlp/releases/\
+                        latest/download/{name}"), &yt, "yt-dlp")?;
+        #[cfg(unix)]
+        make_exec(&yt);
+    }
+
+    let ff = bindir.join(format!("ffmpeg{exe}"));
+    if ff.exists() {
+        say!("ffmpeg: present, skipping");
+    } else {
+        #[cfg(windows)]
+        {
+            let arc = tmp.join("ffmpeg.zip");
+            fetch("https://www.gyan.dev/ffmpeg/builds/\
+                   ffmpeg-release-essentials.zip", &arc,
+                  "ffmpeg static (~80 MB)")?;
+            untar(&arc, &tmp, "ffmpeg")?;
+            copy_bins(&tmp, &bindir,
+                      &["ffmpeg.exe", "ffprobe.exe"])?;
+            let _ = std::fs::remove_file(&arc);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let arc = tmp.join("ffmpeg.tar.xz");
+            fetch("https://johnvansickle.com/ffmpeg/releases/\
+                   ffmpeg-release-amd64-static.tar.xz", &arc,
+                  "ffmpeg static")?;
+            untar(&arc, &tmp, "ffmpeg")?;
+            copy_bins(&tmp, &bindir, &["ffmpeg", "ffprobe"])?;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            for b in ["ffmpeg", "ffprobe"] {
+                let arc = tmp.join(format!("{b}.zip"));
+                fetch(&format!("https://evermeet.cx/ffmpeg/\
+                                getrelease/{b}/zip"), &arc, b)?;
+                untar(&arc, &tmp, b)?;
+                copy_bins(&tmp, &bindir, &[b])?;
+            }
+        }
+        for b in ["ffmpeg", "ffprobe"] {
+            let p = bindir.join(format!("{b}{exe}"));
+            if !p.exists() {
+                bail!("ffmpeg extract missing {}", p.display());
+            }
+            #[cfg(unix)]
+            make_exec(&p);
+        }
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+    say!("tools ready under {}", bindir.display());
     Ok(())
 }
 
@@ -388,6 +519,9 @@ pub fn download(models: &Path,
         }
     }
 
+    if let Err(e) = fetch_tools(models) {
+        say!("tools: {e:#} (models still usable)");
+    }
     let _ = std::fs::remove_dir(&tmp);
     say!("models ready under {}", models.display());
     Ok(())

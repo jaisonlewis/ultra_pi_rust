@@ -472,6 +472,9 @@ fn main() -> Result<()> {
     if args.gui {
         bail!("--gui needs a build with --features gui");
     }
+    // tools fetched into <models>/bin/ (ups-prep models) resolve
+    // without the user editing system PATH
+    models::add_bin_to_path(&args.models);
     if args.batch {
         return run_batch(&args);
     }

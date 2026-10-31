@@ -18,6 +18,11 @@ enum Job {
     Search,
     Batch,
     Models,
+    Tools,
+}
+
+fn add_tools_to_path(models_dir: &str) {
+    crate::models::add_bin_to_path(Path::new(models_dir));
 }
 
 // -- persisted prefs ---------------------------------------------------------
@@ -128,7 +133,23 @@ pub fn run() -> anyhow::Result<()> {
             .with_min_inner_size([560.0, 460.0]),
         ..Default::default()
     };
-    eframe::run_native("Ultra Pi Star — song prep", opts, Box::new(|_| {
+    eframe::run_native("Ultra Pi Star — song prep", opts, Box::new(|cc| {
+        // boombox skin to match the web UI: warm charcoal, phosphor
+        // amber accents
+        let mut v = egui::Visuals::dark();
+        v.panel_fill = egui::Color32::from_rgb(0x16, 0x12, 0x10);
+        v.window_fill = egui::Color32::from_rgb(0x20, 0x1a, 0x15);
+        v.extreme_bg_color = egui::Color32::from_rgb(0x13, 0x10, 0x09);
+        v.faint_bg_color = egui::Color32::from_rgb(0x2b, 0x23, 0x1b);
+        let amber = egui::Color32::from_rgb(0xff, 0xb5, 0x45);
+        v.selection.bg_fill = egui::Color32::from_rgb(0x66, 0x50, 0x1e);
+        v.hyperlink_color = amber;
+        v.widgets.noninteractive.fg_stroke.color =
+            egui::Color32::from_rgb(0xed, 0xe4, 0xd3);
+        v.widgets.active.bg_fill = amber;
+        v.widgets.active.fg_stroke.color =
+            egui::Color32::from_rgb(0x1a, 0x12, 0x08);
+        cc.egui_ctx.set_visuals(v);
         Ok(Box::new(PrepApp::default()))
     }))
     .map_err(|e| anyhow::anyhow!("window: {e}"))
@@ -241,6 +262,7 @@ impl PrepApp {
         self.rx = Some(rx);
         self.busy = true;
         self.status = "working…".into();
+        add_tools_to_path(&self.models_dir());
         // missing models don't hard-fail (prep degrades gracefully),
         // but a first-timer should know *why* output is limited
         if matches!(job, Job::Prep | Job::Queue | Job::Batch) {
@@ -282,6 +304,8 @@ impl PrepApp {
                 Job::Batch => crate::run_batch(&args),
                 Job::Models =>
                     crate::models::download(&args.models, Some(&packs)),
+                Job::Tools =>
+                    crate::models::fetch_tools(&args.models),
             };
             let _ = tx.send(match r {
                 Ok(()) => DONE.to_string(),
@@ -352,6 +376,7 @@ impl PrepApp {
     /// green, then collapses into a one-line "setup complete" strip
     /// that can be reopened.
     fn setup_card(&mut self, ui: &mut egui::Ui) {
+        add_tools_to_path(&self.models_dir());
         if self.tools.is_none() {
             self.tools = Some((tool_on_path("yt-dlp"),
                                tool_on_path("ffmpeg")));
@@ -360,12 +385,12 @@ impl PrepApp {
         let tools = Step {
             ok: ytdlp && ffmpeg,
             detail: if ytdlp && ffmpeg {
-                "yt-dlp + ffmpeg on PATH".into()
+                "yt-dlp + ffmpeg".into()
             } else {
                 let mut m: Vec<&str> = Vec::new();
                 if !ytdlp { m.push("yt-dlp"); }
                 if !ffmpeg { m.push("ffmpeg"); }
-                format!("install {} and relaunch", m.join(" + "))
+                format!("{} not found", m.join(" + "))
             },
         };
         let lib = Step {
@@ -401,7 +426,18 @@ impl PrepApp {
                     self.setup_open = false;
                 }
             });
-            Self::step_row(ui, 1, "Tools", &tools, |_| {});
+            Self::step_row(ui, 1, "Tools", &tools, |ui| {
+                if !tools.ok {
+                    let b = ui.add_enabled(!self.busy,
+                        egui::Button::new("Install").small()
+                    ).on_hover_text(
+                        "downloads yt-dlp + ffmpeg static builds \
+                         into the models dir — no admin needed");
+                    if b.clicked() {
+                        self.start(Job::Tools);
+                    }
+                }
+            });
             Self::step_row(ui, 2, "Library folder", &lib, |ui| {
                 if ui.small_button("Browse…").clicked() {
                     if let Some(p) =
@@ -463,6 +499,7 @@ impl eframe::App for PrepApp {
                     self.log.push_back("— finished —".into());
                     // a Models job just wrote new files — recheck
                     self.model_status = None;
+                    self.tools = None;
                 } else if let Some(e) = m.strip_prefix(ERR) {
                     self.busy = false;
                     self.status = format!("failed: {e}");
