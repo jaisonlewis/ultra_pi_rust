@@ -1063,7 +1063,7 @@ async fn api_mic(AxState(app): AxState<Arc<App>>, headers: HeaderMap)
         "my_fx": null,
         "muted": mon.map(|m| *m.muted.lock().unwrap()).unwrap_or(true),
         "passthrough": mon.is_some(),
-        "mic_delay_ms": *app.mic_delay_ms.lock().unwrap(),
+        "mic_delay_ms": *app.st.mic_delay_ms.lock().unwrap(),
         "music_volume": *app.music_volume.lock().unwrap(),
         "can_mix": is_host(&app, &headers, &sid) || is_singer(&app, &sid),
     }))
@@ -1107,12 +1107,20 @@ async fn api_mic_set(AxState(app): AxState<Arc<App>>, headers: HeaderMap,
     .into_response()
 }
 
-/// POST /api/mic/calibrate — Python listens to the room to measure mic
-/// latency; until that lands, return the stored delay so the UI works.
+/// POST /api/mic/calibrate — play clicks through the output, matched-
+/// filter the mic capture for them, and persist the median loop delay.
+/// Scoring shifts media position back by it (Python semantics).
 async fn api_mic_calibrate(AxState(app): AxState<Arc<App>>)
     -> impl IntoResponse {
-    Json(json!({"ok": true,
-                "mic_delay_ms": *app.mic_delay_ms.lock().unwrap()}))
+    match tokio::task::spawn_blocking(crate::mic::calibrate).await {
+        Ok(Ok(ms)) => {
+            *app.st.mic_delay_ms.lock().unwrap() = ms;
+            app.st.persist();
+            Json(json!({"ok": true, "mic_delay_ms": ms}))
+        }
+        Ok(Err(e)) => Json(json!({"ok": false, "error": e})),
+        Err(e) => Json(json!({"ok": false, "error": e.to_string()})),
+    }
 }
 
 /// POST /api/mic/assign — single-mic setups have nothing to route yet;

@@ -99,6 +99,11 @@ pub trait Driver: Send + Sync {
     fn host_badge(&self) -> Option<String> {
         None
     }
+    /// Calibrated speaker->mic loop delay — scoring ticks run on the
+    /// media position the singer was actually responding to.
+    fn mic_delay_ms(&self) -> f64 {
+        0.0
+    }
 }
 
 /// Native panel resolution — the first DRM mode is the preferred one
@@ -765,7 +770,11 @@ fn play_item(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
                 for tr in &tracks {
                     tones.insert(tr.clone(), tone);
                 }
-                let r = s.tick(pos_ms, &tones);
+                // pitch heard now was sung mic_delay ago — score it
+                // at the media position it answered (Python parity)
+                let score_ms =
+                    (pos_ms - driver.mic_delay_ms()).max(0.0);
+                let r = s.tick(score_ms, &tones);
                 if driver.autosync_enabled() {
                     if let Some(a) = s.maybe_autosync(pos_ms) {
                         if let Some(off) = a["offset_ms"].as_f64() {

@@ -180,7 +180,6 @@ fn main() {
                 sing: Mutex::new(None),
                 tv_sid: Mutex::new(None),
                 music_volume: Mutex::new(1.0),
-                mic_delay_ms: Mutex::new(40.0),
                 auto_next: Mutex::new(0.0),
                 native_tv,
                 paused: std::sync::atomic::AtomicBool::new(false),

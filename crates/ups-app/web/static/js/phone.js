@@ -292,6 +292,7 @@ $("#btn-calib").addEventListener("click", async () => {
   b.disabled = true; b.textContent = "Listening…";
   try {
     const r = await api("/api/mic/calibrate", "POST", {});
+    if (r.mic_delay_ms == null) { toast(r.error || "Calibration failed", "error"); return; }
     $("#mic-delay-v").textContent = Math.round(r.mic_delay_ms);
     toast(`Mic delay: ${Math.round(r.mic_delay_ms)} ms — scoring adjusted`);
   } catch (e) { toast(e.message, "error"); }

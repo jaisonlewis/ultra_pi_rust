@@ -210,6 +210,11 @@ struct Persisted {
     autosync_mic: Option<bool>,
     #[serde(default)]
     output_target: Option<String>,
+    /// measured speaker->mic loop delay (POST /mic/calibrate) — scoring
+    /// shifts media position back by it so pitch is judged against the
+    /// music the singer was actually hearing
+    #[serde(default)]
+    mic_delay_ms: Option<f64>,
 }
 
 pub struct State {
@@ -242,6 +247,9 @@ pub struct State {
     pub autosync_mic: Mutex<bool>,
     /// saved audio output (sink_name or card json) applied at boot
     pub output_target: Mutex<Option<String>>,
+    /// calibrated speaker->mic loop delay, subtracted from the media
+    /// position at scoring ticks (persisted)
+    pub mic_delay_ms: Mutex<f64>,
 }
 
 #[derive(Clone)]
@@ -283,6 +291,7 @@ impl State {
             sync_offsets: Mutex::new(BTreeMap::new()),
             autosync_mic: Mutex::new(true),
             output_target: Mutex::new(None),
+            mic_delay_ms: Mutex::new(40.0),
         };
         st.restore();
         st
@@ -318,6 +327,9 @@ impl State {
             *self.autosync_mic.get_mut().unwrap() = a;
         }
         *self.output_target.get_mut().unwrap() = p.output_target;
+        if let Some(d) = p.mic_delay_ms {
+            *self.mic_delay_ms.get_mut().unwrap() = d;
+        }
     }
 
     pub fn persist(&self) {
@@ -331,6 +343,7 @@ impl State {
             sync_offsets: self.sync_offsets.lock().unwrap().clone(),
             autosync_mic: Some(*self.autosync_mic.lock().unwrap()),
             output_target: self.output_target.lock().unwrap().clone(),
+            mic_delay_ms: Some(*self.mic_delay_ms.lock().unwrap()),
         };
         let path = self.state_path.read().unwrap().clone();
         let tmp = path.with_extension("tmp");

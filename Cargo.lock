@@ -4743,6 +4743,7 @@ dependencies = [
  "cpal",
  "minijinja",
  "qrcode",
+ "rodio",
  "rust-embed",
  "serde",
  "serde_json",

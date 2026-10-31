@@ -31,7 +31,7 @@ pub struct App {
     pub sing: Mutex<Option<SingCtx>>,
     pub tv_sid: Mutex<Option<String>>,
     pub music_volume: Mutex<f64>,
-    pub mic_delay_ms: Mutex<f64>,
+
     pub auto_next: Mutex<f64>,
     /// native TV renderer present → don't wait on a browser
     pub native_tv: bool,
@@ -149,6 +149,10 @@ impl ups_tv::Driver for App {
 
     fn autosync_enabled(&self) -> bool {
         *self.st.autosync_mic.lock().unwrap()
+    }
+
+    fn mic_delay_ms(&self) -> f64 {
+        *self.st.mic_delay_ms.lock().unwrap()
     }
 
     fn take_sync_override(&self) -> Option<f64> {
@@ -457,6 +461,12 @@ pub fn register(io: &SocketIo, app: std::sync::Arc<App>) {
                     slot.as_mut().map(|sing| {
                         let tones = sing.tones.lock().unwrap().clone();
                         let mic_tone = tones.values().find_map(|v| *v);
+                        // pitch arriving now was sung mic_delay ago —
+                        // score it against the music position it was a
+                        // response to (Python sockets.py semantics)
+                        let delay = *app.st.mic_delay_ms
+                            .lock().unwrap();
+                        let ms = (ms - delay).max(0.0);
                         let r = sing.session.tick(ms, &tones);
                         sing.last_ms = ms;
                         // pitch-contour autosync — apply a confident
