@@ -78,6 +78,8 @@ struct Args {
     align_diag: bool,
     /// open the native window instead of running the CLI pipeline
     gui: bool,
+    /// rechart even charts the ctc aligner already produced
+    force: bool,
 }
 
 impl Args {
@@ -101,6 +103,7 @@ impl Args {
             dl_models: self.dl_models,
             align_diag: self.align_diag,
             gui: self.gui,
+            force: self.force,
         }
     }
 }
@@ -127,6 +130,7 @@ fn parse_args() -> Result<Args> {
         dl_models: false,
         align_diag: false,
         gui: false,
+        force: false,
     };
     while let Some(arg) = a.next() {
         match arg.as_str() {
@@ -148,6 +152,7 @@ fn parse_args() -> Result<Args> {
                 a.next().context("--shard")?.parse()?,
             "--shards" => args.shards =
                 a.next().context("--shards")?.parse()?,
+            "--force" => args.force = true,
             "-h" | "--help" => {
                 println!(
                     "ups-prep <youtube-url | playlist-url | media-file> \
@@ -895,13 +900,17 @@ fn run_batch(args: &Args) -> Result<()> {
     let total = songs.len();
     let (mut redone, mut skipped, mut failed) = (0u32, 0u32, 0u32);
     for (i, song) in songs.iter().enumerate() {
-        // an imported (non-generated) chart is human-timed — keep it
+        // an imported (non-generated) chart is human-timed — keep it;
+        // a chart already made by the ctc aligner is current — keep
+        // it too so interrupted sweeps resume instead of redoing
         if let Some(cp) = &song.chart {
             let c = ups_core::chart::load_chart(cp);
             let gen = c.headers.get("CREATOR")
                     .is_some_and(|v| v.contains("genchart"))
                 || c.source["type"].as_str() == Some("generated");
-            if !gen {
+            let aligned = c.source["lyrics"].as_str()
+                .is_some_and(|v| v.starts_with("ctc-"));
+            if !gen || (aligned && !args.force) {
                 skipped += 1;
                 continue;
             }

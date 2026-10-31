@@ -26,7 +26,7 @@ use ort::session::Session;
 use ort::value::Tensor;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use crate::rmvpe::ort_env;
 
 pub const SR: usize = 16_000;
 /// a word whose path posterior falls below this is "not heard" —
@@ -116,13 +116,6 @@ pub fn backend_for(models: &Path, lang: &str) -> Option<Backend> {
 
 pub fn have_model(models: &Path) -> bool {
     parakeet_dir(models).is_some() || omni_dir(models).is_some()
-}
-
-fn ort_env() -> &'static ort::environment::Environment {
-    static ENV: OnceLock<ort::environment::Environment> = OnceLock::new();
-    ENV.get_or_init(|| {
-        ort::init().with_name("ups-prep").build().expect("ort environment")
-    })
 }
 
 impl Aligner {

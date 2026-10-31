@@ -27,15 +27,20 @@ fn model_path(models: &Path) -> PathBuf {
     models.join("rmvpe.onnx")
 }
 
-/// 16k mono f32 → RMVPE curve.
-pub fn extract_curve(audio16: &[f32], models: &Path) -> Result<Curve> {
-    // ort allows exactly one Environment per process — share it
+/// ort allows exactly one Environment per process — every model in
+/// this binary shares it through here.
+pub(crate) fn ort_env() -> &'static ort::environment::Environment {
     static ENV: OnceLock<ort::environment::Environment> =
         OnceLock::new();
-    let env = ENV.get_or_init(|| {
+    ENV.get_or_init(|| {
         ort::init().with_name("ups-prep").build()
             .expect("ort environment")
-    });
+    })
+}
+
+/// 16k mono f32 → RMVPE curve.
+pub fn extract_curve(audio16: &[f32], models: &Path) -> Result<Curve> {
+    let env = ort_env();
     let mut sess = Session::builder(env)?
         .commit_from_file(model_path(models))
         .context("load rmvpe.onnx")?;
