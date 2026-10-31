@@ -237,7 +237,8 @@ fn asr_lines(asr: &Asr, gap_ms: f64,
             let li = texts.len() - 1;
             spans.insert(li, Span {
                 onset_ms: cur[0].1,
-                end_ms: run_end(cur.last().unwrap().1, runs),
+                end_ms: run_end(cur.last().unwrap().1, runs)
+                    .min(cur.last().unwrap().1 + MAX_HELD_MS),
                 cov: 1.0,
                 words: idxs.iter().copied().enumerate()
                     .map(|(p, a)| (p, a)).collect(),
@@ -255,7 +256,8 @@ fn asr_lines(asr: &Asr, gap_ms: f64,
         let li = texts.len() - 1;
         spans.insert(li, Span {
             onset_ms: cur[0].1,
-            end_ms: run_end(cur.last().unwrap().1, runs),
+            end_ms: run_end(cur.last().unwrap().1, runs)
+                    .min(cur.last().unwrap().1 + MAX_HELD_MS),
             cov: 1.0,
             words: idxs.iter().copied().enumerate()
                 .map(|(p, a)| (p, a)).collect(),

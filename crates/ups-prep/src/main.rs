@@ -780,7 +780,7 @@ fn run_batch(args: &Args) -> Result<()> {
     if args.shards > 1 {
         // deterministic partition — same song always lands in the
         // same shard regardless of scan order
-        let mut h = |s: &ups_core::catalog::Song| -> u32 {
+        let h = |s: &ups_core::catalog::Song| -> u32 {
             use std::hash::{Hash, Hasher};
             let mut x = std::collections::hash_map::DefaultHasher::new();
             s.dir.hash(&mut x);
