@@ -231,7 +231,9 @@ pub struct State {
     pub host_performer_id: Mutex<Option<i64>>,
     next_performer: Mutex<i64>,
     next_queue_item: Mutex<i64>,
-    state_path: PathBuf,
+    /// `ups-state.json` lives beside the songs on the primary root —
+    /// re-pointed when a root swap changes which stick is primary
+    state_path: RwLock<PathBuf>,
     /// item_id -> epoch when its countdown ends
     pub play_at: Mutex<BTreeMap<i64, f64>>,
     /// entry_id -> chart->media nudge (persists across restarts)
@@ -276,7 +278,7 @@ impl State {
             host_performer_id: Mutex::new(None),
             next_performer: Mutex::new(1),
             next_queue_item: Mutex::new(1),
-            state_path,
+            state_path: RwLock::new(state_path),
             play_at: Mutex::new(BTreeMap::new()),
             sync_offsets: Mutex::new(BTreeMap::new()),
             autosync_mic: Mutex::new(true),
@@ -287,7 +289,9 @@ impl State {
     }
 
     fn restore(&mut self) {
-        let Ok(raw) = std::fs::read_to_string(&self.state_path) else {
+        let Ok(raw) = std::fs::read_to_string(
+            self.state_path.read().unwrap().as_path(),
+        ) else {
             return;
         };
         let Ok(p) = serde_json::from_str::<Persisted>(&raw) else {
@@ -326,10 +330,11 @@ impl State {
             autosync_mic: Some(*self.autosync_mic.lock().unwrap()),
             output_target: self.output_target.lock().unwrap().clone(),
         };
-        let tmp = self.state_path.with_extension("tmp");
+        let path = self.state_path.read().unwrap().clone();
+        let tmp = path.with_extension("tmp");
         if let Ok(s) = serde_json::to_string(&p) {
             if std::fs::write(&tmp, s).is_ok() {
-                let _ = std::fs::rename(&tmp, &self.state_path);
+                let _ = std::fs::rename(&tmp, &path);
             }
         }
     }
@@ -367,7 +372,18 @@ impl State {
                           .map(|p| p.display().to_string())
                           .collect::<Vec<_>>()
                           .join(", "));
+            // scores/queue/performers are the running party's — carry
+            // them to whichever stick is primary now rather than
+            // swapping in a stranger's state mid-session
+            if next.first() != roots.first() {
+                if let Some(primary) = next.first() {
+                    *self.state_path.write().unwrap() =
+                        primary.join("ups-state.json");
+                }
+            }
             *roots = next;
+            drop(roots);
+            self.persist();
             true
         } else {
             false
