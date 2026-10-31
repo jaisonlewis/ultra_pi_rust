@@ -964,10 +964,9 @@ fn play_item(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
         }
 
         if let Some(t) = text {
-            let lh_y = (fh as f64 * 0.82) as i32;
             let row_h = (lyric_px as f64 * 1.30) as i32;
-            // one current line per claimed part — duets stack P1 over
-            // P2, each karaoke-wiped in its own track color
+            // one current line per claimed part — extra parts stack
+            // UPWARD so the band never grows past the bottom edge
             let curs: Vec<(usize, &chart::Phrase)> = track_text
                 .iter()
                 .enumerate()
@@ -987,18 +986,19 @@ fn play_item(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
                     gap_ms + p.start as f64 * beat_ms > pos_ms
                 })
             });
+            let rows = curs.len().max(1) as i32;
+            let lh_y = (fh as f64 * 0.82) as i32 - (rows - 1) * row_h;
+            let ny = lh_y + rows * row_h + (18.0 * s) as i32;
             // the lyric card — same .lyric-band look as the browser TV:
             // a translucent dark rounded panel behind both lines so the
             // text reads over any video
             if !curs.is_empty() || next.is_some() {
                 let pad_v = (lyric_px as f64 * 0.42) as i32;
-                let y1 = lh_y + curs.len() as i32 * row_h
-                    + (62.0 * s) as i32 + next_px as i32
-                    + (lyric_px as f64 * 0.30) as i32;
                 render::rrect(
                     fb, fw, fh,
                     (fw as f64 * 0.05) as i32, lh_y - pad_v,
-                    (fw as f64 * 0.90) as i32, y1 - lh_y + pad_v,
+                    (fw as f64 * 0.90) as i32,
+                    ny + next_px as i32 + pad_v - lh_y + pad_v,
                     (14.0 * s) as i32, 0x070b16, 208,
                 );
             }
@@ -1035,8 +1035,6 @@ fn play_item(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
             if let Some(p) = next {
                 let w = tb.width(&p.text, next_px) as i32;
                 let nx = (fw as i32 - w) / 2;
-                let ny = lh_y + curs.len() as i32 * row_h
-                    + (62.0 * s) as i32;
                 let o = ((next_px as f64) / 26.0).ceil().max(1.0) as i32;
                 tb.draw_outline(fb, fw, fh, &p.text, nx, ny, next_px,
                                 0x05070d, o);
