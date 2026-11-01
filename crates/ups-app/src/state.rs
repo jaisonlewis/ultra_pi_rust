@@ -240,6 +240,11 @@ struct Persisted {
     /// music the singer was actually hearing
     #[serde(default)]
     mic_delay_ms: Option<f64>,
+    /// output-pipe latency — get_pos runs this far ahead of audible;
+    /// the presentation clock subtracts it. Seeded by calibration as
+    /// mic_delay minus the input-path estimate; host-adjustable.
+    #[serde(default)]
+    display_delay_ms: Option<f64>,
     /// performer_id -> saved voice FX — follows the singer between
     /// songs and across restarts (Python performer_fx:<id> settings)
     #[serde(default)]
@@ -294,6 +299,9 @@ pub struct State {
     /// calibrated speaker->mic loop delay, subtracted from the media
     /// position at scoring ticks (persisted)
     pub mic_delay_ms: Mutex<f64>,
+    /// output-pipe latency subtracted from the presentation clock so
+    /// video/lyrics/lane draw on audible position (persisted)
+    pub display_delay_ms: Mutex<f64>,
     /// performer_id -> saved voice FX profile (persisted)
     pub performer_fx: Mutex<BTreeMap<i64, FxProfile>>,
     /// persisted room monitor/music levels — Monitor + App seed from
@@ -347,6 +355,7 @@ impl State {
             autosync_mic: Mutex::new(true),
             output_target: Mutex::new(None),
             mic_delay_ms: Mutex::new(40.0),
+            display_delay_ms: Mutex::new(0.0),
             performer_fx: Mutex::new(BTreeMap::new()),
             mic_volume: Mutex::new(0.8),
             mic_muted: Mutex::new(false),
@@ -402,6 +411,14 @@ impl State {
         if let Some(d) = p.mic_delay_ms {
             *self.mic_delay_ms.get_mut().unwrap() = d;
         }
+        if let Some(d) = p.display_delay_ms {
+            *self.display_delay_ms.get_mut().unwrap() = d;
+        } else if let Some(d) = p.mic_delay_ms {
+            // legacy state — seed display compensation from the
+            // measured loop the same way a fresh calibration does
+            *self.display_delay_ms.get_mut().unwrap() =
+                (d - 30.0).clamp(0.0, 500.0);
+        }
         *self.performer_fx.get_mut().unwrap() = p.performer_fx;
         if let Some(v) = p.mic_volume {
             *self.mic_volume.get_mut().unwrap() = v;
@@ -437,6 +454,8 @@ impl State {
         let autosync_mic = Some(*self.autosync_mic.lock().unwrap());
         let output_target = self.output_target.lock().unwrap().clone();
         let mic_delay_ms = Some(*self.mic_delay_ms.lock().unwrap());
+        let display_delay_ms =
+            Some(*self.display_delay_ms.lock().unwrap());
         let performer_fx = self.performer_fx.lock().unwrap().clone();
         let mic_volume = Some(*self.mic_volume.lock().unwrap());
         let mic_muted = Some(*self.mic_muted.lock().unwrap());
@@ -447,8 +466,8 @@ impl State {
             performers, queue, history, next_performer,
             next_queue_item, host_performer_id, sync_offsets,
             sync_offset_charts, autosync_mic, output_target,
-            mic_delay_ms, performer_fx, mic_volume, mic_muted,
-            mic_echo_ms, music_volume, room_fx,
+            mic_delay_ms, display_delay_ms, performer_fx, mic_volume,
+            mic_muted, mic_echo_ms, music_volume, room_fx,
         };
         let path = self.state_path.read().unwrap().clone();
         let tmp = path.with_extension("tmp");

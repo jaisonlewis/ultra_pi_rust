@@ -1072,6 +1072,7 @@ async fn api_mic(AxState(app): AxState<Arc<App>>, headers: HeaderMap)
         "muted": mon.map(|m| *m.muted.lock().unwrap()).unwrap_or(true),
         "passthrough": mon.is_some(),
         "mic_delay_ms": *app.st.mic_delay_ms.lock().unwrap(),
+        "display_delay_ms": *app.st.display_delay_ms.lock().unwrap(),
         "music_volume": *app.music_volume.lock().unwrap(),
         "can_mix": is_host(&app, &headers, &sid) || is_singer(&app, &sid),
     }))
@@ -1105,6 +1106,12 @@ async fn api_mic_set(AxState(app): AxState<Arc<App>>, headers: HeaderMap,
         body["muted"].as_bool(),
         body["echo_ms"].as_i64(),
     );
+    // display-latency nudge — A/V sync for THIS panel; TVs differ,
+    // so it lives beside the other room levels, not per-singer
+    if let Some(v) = body["display_delay_ms"].as_f64() {
+        *app.st.display_delay_ms.lock().unwrap() = v.clamp(0.0, 500.0);
+        app.st.persist();
+    }
     if body.get("volume").is_some()
         || body.get("muted").is_some()
         || body.get("echo_ms").is_some()
@@ -1169,6 +1176,7 @@ async fn api_mic_set(AxState(app): AxState<Arc<App>>, headers: HeaderMap,
         "autotune": fx.autotune, "polish": fx.polish,
         "my_fx": my_fx,
         "muted": *mon.muted.lock().unwrap(),
+        "display_delay_ms": *app.st.display_delay_ms.lock().unwrap(),
     }))
     .into_response()
 }
@@ -1194,8 +1202,17 @@ async fn api_mic_calibrate(AxState(app): AxState<Arc<App>>)
     match tokio::task::spawn_blocking(crate::mic::calibrate).await {
         Ok(Ok(ms)) => {
             *app.st.mic_delay_ms.lock().unwrap() = ms;
+            // the click loop can't split the input leg from the output
+            // pipe — the estimate covers USB-mic + pipewire capture +
+            // air (~30ms), leaving the rest as display compensation.
+            // Hosts can nudge /api/mic display_delay_ms per-panel.
+            const INPUT_EST_MS: f64 = 30.0;
+            *app.st.display_delay_ms.lock().unwrap() =
+                (ms - INPUT_EST_MS).clamp(0.0, 500.0);
             app.st.persist();
-            Json(json!({"ok": true, "mic_delay_ms": ms}))
+            Json(json!({"ok": true, "mic_delay_ms": ms,
+                        "display_delay_ms":
+                            *app.st.display_delay_ms.lock().unwrap()}))
         }
         Ok(Err(e)) => Json(json!({"ok": false, "error": e})),
         Err(e) => Json(json!({"ok": false, "error": e.to_string()})),

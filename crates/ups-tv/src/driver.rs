@@ -106,6 +106,14 @@ pub trait Driver: Send + Sync {
     fn mic_delay_ms(&self) -> f64 {
         0.0
     }
+    /// Output-pipe latency — how far `sink.get_pos()` runs AHEAD of
+    /// what's audible. The mic-cal loop can't split input from output
+    /// legs, so this is seeded as mic_delay minus the input estimate
+    /// and is host-adjustable per display. Everything visible draws
+    /// on pos-display_delay; scoring stays on the full loop delay.
+    fn display_delay_ms(&self) -> f64 {
+        0.0
+    }
 }
 
 /// Native panel resolution — the first DRM mode is the preferred one
@@ -791,9 +799,15 @@ fn play_item(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
         let pos_ms = audio_done_at
             .map(|t| dur_ms + t.elapsed().as_secs_f64() * 1000.0)
             .unwrap_or(audio_pos_ms);
+        // presentation clock — get_pos is mixer-drain position, ahead
+        // of audible by the output pipe (pipewire→ALSA→HDMI→TV). Draw
+        // on the audible position so video, lane and lyrics line up
+        // with what the singer actually hears; scoring/score_ms stay
+        // on the unshifted clock + full mic-loop delay.
+        let pos_draw = (pos_ms - driver.display_delay_ms()).max(0.0);
 
         if let Some(p) = &mut pipe {
-            let want = (pos_ms / 1000.0 * p.fps) as u64;
+            let want = (pos_draw / 1000.0 * p.fps) as u64;
             loop {
                 if p.frames >= want {
                     break;
@@ -872,7 +886,7 @@ fn play_item(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
                         .and_then(|h| h.tone)
                         .unwrap_or(24);
                     let (px, ty) = render::lane_xy(
-                        geo, lane_y, band_h, pos_ms, pos_ms, tone);
+                        geo, lane_y, band_h, pos_draw, pos_draw, tone);
                     let gold = r
                         .last_hit
                         .as_ref()
@@ -959,7 +973,7 @@ fn play_item(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
             // audio-only: FFT the playhead's PCM window, draw the
             // kaleidoscope into its own buffer (motion trails must not
             // smear the lyrics/lane overlaid after), then composite
-            let bands = v.analyze(pcm, *ch, *rate, pos_ms);
+            let bands = v.analyze(pcm, *ch, *rate, pos_draw);
             v.step();
             viz::draw(vfb, fw, fh, v, &bands);
             fb.copy_from_slice(vfb);
@@ -974,7 +988,7 @@ fn play_item(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
                 let skin = track_skin(i, duet);
                 render::draw_lane(
                     fb, fw, fh, &track_text[i].1, gap_ms, beat_ms,
-                    pos_ms, by, band_h, 6000.0, mic_tone_for(i),
+                    pos_draw, by, band_h, 6000.0, mic_tone_for(i),
                     i == 0 && flash, (skin.0, skin.1),
                 );
                 if let Some(log) = sess
@@ -982,7 +996,7 @@ fn play_item(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
                     .and_then(|s| s.tone_log.get(tr))
                 {
                     render::draw_trail(
-                        fb, fw, fh, log, pos_ms, by, band_h, 6000.0,
+                        fb, fw, fh, log, pos_draw, by, band_h, 6000.0,
                         skin.2, skin.3,
                     );
                 }
@@ -999,8 +1013,8 @@ fn play_item(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
                 .filter_map(|(i, tt)| {
                     tt.0.iter()
                         .find(|p| {
-                            pos_ms >= gap_ms + p.start as f64 * beat_ms
-                                && pos_ms
+                            pos_draw >= gap_ms + p.start as f64 * beat_ms
+                                && pos_draw
                                     < gap_ms + p.end as f64 * beat_ms
                                         + 400.0
                         })
@@ -1009,7 +1023,7 @@ fn play_item(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
                 .collect();
             let next = track_text.first().and_then(|tt| {
                 tt.0.iter().find(|p| {
-                    gap_ms + p.start as f64 * beat_ms > pos_ms
+                    gap_ms + p.start as f64 * beat_ms > pos_draw
                 })
             });
             let rows = curs.len().max(1) as i32;
@@ -1039,7 +1053,7 @@ fn play_item(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
                 for syl in &p.syls {
                     let s_ms = gap_ms + syl.s as f64 * beat_ms;
                     let e_ms = gap_ms + syl.e as f64 * beat_ms;
-                    let f = ((pos_ms - s_ms)
+                    let f = ((pos_draw - s_ms)
                         / (e_ms - s_ms).max(1.0))
                     .clamp(0.0, 1.0);
                     let sw = tb.width(&syl.t, lyric_px) as i32;

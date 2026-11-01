@@ -189,6 +189,10 @@ impl ups_tv::Driver for App {
         *self.st.mic_delay_ms.lock().unwrap()
     }
 
+    fn display_delay_ms(&self) -> f64 {
+        *self.st.display_delay_ms.lock().unwrap()
+    }
+
     fn take_sync_override(&self) -> Option<f64> {
         self.sync_override.lock().unwrap().take()
     }
