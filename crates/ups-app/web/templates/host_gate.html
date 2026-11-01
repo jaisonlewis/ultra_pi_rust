@@ -2,12 +2,17 @@
 {% block title %}Host access{% endblock %}
 {% block body_class %}phone{% endblock %}
 {% block content %}
+<header class="phone-header">
+  <h1>Ultra Pi Star</h1>
+</header>
+
 <section class="card gate">
-  <h1>Host only</h1>
-  <p>This console needs the host key shown on the server console at startup.</p>
+  <h2>Host access</h2>
+  <p class="muted">Enter the host key — it glows in the corner of the TV.</p>
   <form method="get" action="/host" class="row">
-    <input name="key" type="password" placeholder="Host key" required>
-    <button class="primary" type="submit">Enter</button>
+    <input name="key" type="password" placeholder="host key" required
+           class="led" autocomplete="off">
+    <button class="primary" type="submit">Unlock</button>
   </form>
 </section>
 {% endblock %}
