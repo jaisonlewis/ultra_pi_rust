@@ -141,7 +141,8 @@ impl ups_tv::Driver for App {
         self.persist_and_push();
     }
 
-    fn item_error(&self, id: i64, _msg: &str) {
+    fn item_error(&self, id: i64, msg: &str) {
+        eprintln!("tv: item {id} error — {msg}");
         let _ = self.io.broadcast().emit(
             "toast",
             &json!({"kind":"warn","text":"media error — next"}),

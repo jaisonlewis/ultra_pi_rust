@@ -17,7 +17,7 @@ use rodio::{OutputStream, Sink, Source};
 use serde_json::{json, Value};
 use ups_core::chart::{self, Chart};
 use ups_core::capture::MicCapture;
-use ups_core::decode::StreamingSource;
+use ups_core::decode;
 use ups_core::session::Session;
 
 use crate::render;
@@ -533,12 +533,26 @@ fn play_item(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
     let audio_p = it.audio.clone();
     let video_p = it.video.clone();
     let preload = std::thread::spawn(move || {
-        let src = StreamingSource::open(&audio_p).ok();
-        let pcm = src.map(|s| {
-            let ch = s.channels();
-            let rate = s.sample_rate();
-            (s.collect::<Vec<f32>>(), ch, rate)
-        });
+        // symphonia first, ffmpeg's PCM pipe when symphonia can't
+        // (zeroed mp4a rate fields, codecs it lacks). The failing
+        // decode used to vanish into `.ok()` and only surface as a
+        // skipped song — log which decoder won.
+        let pcm = match decode::open_audio(&audio_p) {
+            Ok((s, tag)) => {
+                let ch = s.channels();
+                let rate = s.sample_rate();
+                let samples = s.collect::<Vec<f32>>();
+                tlog!("audio: {tag} {rate} Hz x{ch}, {:.1}s pcm",
+                      samples.len() as f64
+                          / rate.max(1) as f64
+                          / ch.max(1) as f64);
+                Some((samples, ch, rate))
+            }
+            Err(e) => {
+                tlog!("audio: preload decode failed — {e}");
+                None
+            }
+        };
         let shm = video_p.as_ref().and_then(|v| stage_shm(v));
         (pcm, shm)
     });
@@ -695,8 +709,11 @@ fn play_item(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
             && rate > 0 && ch > 0 => Box::new(
             rodio::buffer::SamplesBuffer::new(ch, rate, samples),
         ),
-        _ => match StreamingSource::open(&it.audio) {
-            Ok(s) => Box::new(s),
+        _ => match decode::open_audio(&it.audio) {
+            Ok((s, tag)) => {
+                tlog!("audio: {tag} fallback source");
+                s
+            }
             Err(e) => {
                 driver.item_error(it.id, &format!("decode: {e}"));
                 std::thread::sleep(Duration::from_millis(300));
@@ -761,6 +778,15 @@ fn play_item(window: &mut Window, fb: &mut [u32], fw: usize, fh: usize,
             && (sink.empty() || (dur > Duration::ZERO && audio_pos_ms >= dur_ms))
         {
             audio_done_at = Some(Instant::now());
+        }
+        // a source that opened but yields nothing empties the sink at
+        // once — without this the song "coasts" its whole duration on
+        // a black screen; fail fast instead
+        if audio_done_at.is_some()
+            && play_start.elapsed() < Duration::from_millis(1500)
+        {
+            driver.item_error(it.id, "audio: source yielded no samples");
+            return;
         }
         let pos_ms = audio_done_at
             .map(|t| dur_ms + t.elapsed().as_secs_f64() * 1000.0)

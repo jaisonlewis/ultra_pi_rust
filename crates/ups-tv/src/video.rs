@@ -83,7 +83,11 @@ impl VideoPipe {
                 "pipe:1",
             ])
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            // -v error already, so only real failures reach stderr —
+            // inheriting it lands them in the service journal instead
+            // of vanishing (a silent decode death looks like this:
+            // "video pipe: open", then nothing, then the song skips)
+            .stderr(Stdio::inherit())
             .stdin(Stdio::null())
             .spawn()
             .ok()?;
@@ -119,6 +123,8 @@ impl VideoPipe {
                     break; // receiver gone
                 }
             }
+            let n = produced_r.load(std::sync::atomic::Ordering::Relaxed);
+            eprintln!("tv: video reader ended ({n} frames)");
         });
         Some(VideoPipe {
             rx,
